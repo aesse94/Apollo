@@ -285,6 +285,17 @@ namespace stream {
       bool nacking = false;
       std::deque<std::pair<std::chrono::steady_clock::time_point, uint16_t>> duplicates;
       uint64_t duplicated = 0;
+
+      // Adaptive bitrate (frogtale_adaptive_bitrate): loss = NACKed / sent outside handoff windows
+      safe::mail_raw_t::event_t<int> bitrate_events;
+      int base_kbps = 0;
+      int current_kbps = 0;
+      int clean_seconds = 0;
+      uint64_t sent = 0;
+      uint64_t nacked_off_window = 0;
+      uint64_t last_sent = 0;
+      uint64_t last_nacked = 0;
+      std::chrono::steady_clock::time_point last_eval;
     };
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
@@ -420,6 +431,7 @@ namespace stream {
       std::memcpy(dst + prefixsize, data, blocksize);
       history.seqs[slot] = seq;
       history.valid[slot] = true;
+      history.sent++;
 
       if (history.nacking && in_handoff_window()) {
         auto now = std::chrono::steady_clock::now();
@@ -448,6 +460,46 @@ namespace stream {
       platf::send(send_info);
     }
 
+    // GeForce Now steps its bitrate down on loss (bwe.packetLossHighThresholdx100 100 = 1%,
+    // packetLossLowThresholdx100 20 = 0.2%, lossyFrameStepDownRatio 50). Handoff windows are excluded:
+    // their loss is expected and the copies cover it. Runs once a second per client.
+    void adapt_bitrate(history_t &history, std::chrono::steady_clock::time_point now) {
+      if (!config::stream.frogtale_adaptive_bitrate || !history.nacking || !history.bitrate_events || !history.base_kbps) {
+        return;
+      }
+      if (now - history.last_eval < std::chrono::seconds(1)) {
+        return;
+      }
+      auto sent = history.sent - history.last_sent;
+      auto nacked = history.nacked_off_window - history.last_nacked;
+      history.last_eval = now;
+      history.last_sent = history.sent;
+      history.last_nacked = history.nacked_off_window;
+      if (sent < 100) {
+        return;  // not streaming, or nothing changing on screen
+      }
+
+      double loss = (double) nacked / (double) sent;
+      int target = history.current_kbps;
+      if (loss > 0.01) {
+        target = std::max(history.base_kbps / 2, history.current_kbps * 7 / 10);
+        history.clean_seconds = 0;
+      } else if (loss < 0.002) {
+        if (++history.clean_seconds >= 5 && history.current_kbps < history.base_kbps) {
+          target = std::min(history.base_kbps, std::max(history.current_kbps * 11 / 10, history.current_kbps + 500));
+          history.clean_seconds = 0;
+        }
+      } else {
+        history.clean_seconds = 0;
+      }
+
+      if (std::abs(target - history.current_kbps) * 20 >= history.current_kbps) {
+        history.bitrate_events->raise(target);
+        BOOST_LOG(info) << "FrogtaleTV ABR: loss "sv << (int) (loss * 1000) / 10.0 << "% -> "sv << target << " kbps (base "sv << history.base_kbps << ")"sv;
+        history.current_kbps = target;
+      }
+    }
+
     // Sends due duplicates for every client. One thread for the process, started on first use.
     void duplicate_thread() {
       platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -463,6 +515,8 @@ namespace stream {
         auto now = std::chrono::steady_clock::now();
         for (auto &history : all) {
           std::lock_guard lg {history->mutex};
+          adapt_bitrate(*history, now);
+
           auto &queue = history->duplicates;
           for (auto it = queue.begin(); it != queue.end();) {
             if (it->first <= now) {
@@ -501,6 +555,8 @@ namespace stream {
       ensure_duplicate_thread();
       learn_handoff_phase();
 
+      bool off_window = !in_handoff_window();
+
       std::lock_guard lg {history->mutex};
       history->nacking = true;
       for (uint16_t r = 0; r < count; r++) {
@@ -509,6 +565,9 @@ namespace stream {
         std::memcpy(&length, payload + 4 + r * 4, sizeof(length));
         first = boost::endian::little_to_native(first);
         length = std::min<uint16_t>(boost::endian::little_to_native(length), HISTORY / 2);
+        if (off_window) {
+          history->nacked_off_window += length;
+        }
 
         for (uint16_t i = 0; i < length; i++) {
           uint16_t seq = first + i;
@@ -653,6 +712,7 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
+      safe::mail_raw_t::event_t<int> frogtale_bitrate_events;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -1812,6 +1872,10 @@ namespace stream {
             nack_history->address = peer_address;
             nack_history->port = session->video.peer.port();
             nack_history->local_address = session->localAddress;
+            nack_history->bitrate_events = session->video.frogtale_bitrate_events;
+            if (!nack_history->base_kbps) {
+              nack_history->base_kbps = nack_history->current_kbps = session->config.monitor.bitrate;
+            }
           }
 
           auto batch_info = platf::batched_send_info_t {
@@ -2480,6 +2544,7 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.frogtale_bitrate_events = mail->event<int>(mail::frogtale_bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

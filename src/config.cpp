@@ -538,6 +538,7 @@ namespace config {
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
 
     0,  // frogtale_pacing_groups
+    0,  // frogtale_adaptive_bitrate
   };
 
   nvhttp_t nvhttp {
@@ -1246,6 +1247,7 @@ namespace config {
     path_f(vars, "file_apps", stream.file_apps);
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
     int_between_f(vars, "frogtale_pacing_groups", stream.frogtale_pacing_groups, {0, 16});
+    int_between_f(vars, "frogtale_adaptive_bitrate", stream.frogtale_adaptive_bitrate, {0, 1});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

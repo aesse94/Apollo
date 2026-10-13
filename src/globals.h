@@ -53,6 +53,7 @@ namespace mail {
   MAIL(touch_port);
   MAIL(idr);
   MAIL(invalidate_ref_frames);
+  MAIL(frogtale_bitrate);
   MAIL(gamepad_feedback);
   MAIL(hdr);
 #undef MAIL

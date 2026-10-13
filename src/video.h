@@ -213,6 +213,9 @@ namespace video {
     virtual void request_normal_frame() = 0;
 
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    // FrogtaleTV patch: change the bitrate mid-stream; only NVENC implements it
+    virtual void set_bitrate(int bitrate_kbps) {}
   };
 
   // encoders

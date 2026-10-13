@@ -177,6 +177,9 @@ namespace config {
 
     // FrogtaleTV patch: send each video FEC block in this many groups 1 ms apart (0 = stock burst)
     int frogtale_pacing_groups;
+
+    // FrogtaleTV patch: lower the bitrate during lossy patches reported by NACKs (0 = off)
+    int frogtale_adaptive_bitrate;
   };
 
   struct nvhttp_t {

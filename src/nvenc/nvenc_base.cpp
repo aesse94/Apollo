@@ -383,6 +383,13 @@ namespace nvenc {
       return false;
     }
 
+    reconfig_state.init_params = init_params;
+    reconfig_state.enc_config = enc_config;
+    reconfig_state.init_params.encodeConfig = &reconfig_state.enc_config;
+    reconfig_state.framerate = client_config.framerate;
+    reconfig_state.vbv_percentage_increase = config.vbv_percentage_increase;
+    reconfig_state.valid = true;
+
     if (async_event_handle) {
       NV_ENC_EVENT_PARAMS event_params = {min_struct_version(NV_ENC_EVENT_PARAMS_VER)};
       event_params.completionEvent = async_event_handle;
@@ -454,6 +461,7 @@ namespace nvenc {
   }
 
   void nvenc_base::destroy_encoder() {
+    reconfig_state.valid = false;
     if (output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
@@ -566,6 +574,38 @@ namespace nvenc {
     encoder_state.frame_size_logger.collect_and_log(encoded_frame.data.size() / 1000.);
 
     return encoded_frame;
+  }
+
+  bool nvenc_base::set_bitrate(uint32_t bitrate_kbps) {
+    if (!encoder || !reconfig_state.valid || !bitrate_kbps) {
+      return false;
+    }
+
+    NV_ENC_CONFIG enc_config = reconfig_state.enc_config;
+    enc_config.rcParams.averageBitRate = bitrate_kbps * 1000;
+    if (enc_config.rcParams.vbvBufferSize && reconfig_state.framerate) {
+      // Keep the one-frame VBV that create_encoder() configured, scaled to the new rate
+      enc_config.rcParams.vbvBufferSize = bitrate_kbps * 1000 / reconfig_state.framerate;
+      if (reconfig_state.vbv_percentage_increase > 0) {
+        enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * reconfig_state.vbv_percentage_increase / 100;
+      }
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
+    reconfigure_params.reInitEncodeParams = reconfig_state.init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &enc_config;
+    reconfigure_params.resetEncoder = 0;
+    reconfigure_params.forceIDR = 0;
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
+      BOOST_LOG(warning) << "NvEnc: NvEncReconfigureEncoder() for bitrate " << bitrate_kbps << " kbps failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    reconfig_state.enc_config = enc_config;
+    reconfig_state.init_params.encodeConfig = &reconfig_state.enc_config;
+    BOOST_LOG(info) << "FrogtaleTV: encoder bitrate now " << bitrate_kbps << " kbps";
+    return true;
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {

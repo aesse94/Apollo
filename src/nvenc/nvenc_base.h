@@ -69,6 +69,15 @@ namespace nvenc {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame);
 
+    /**
+     * @brief FrogtaleTV patch: change the target bitrate of the running encoder.
+     * @details Uses nvEncReconfigureEncoder without resetting the encoder or forcing an IDR, so a
+     *          stream can step its bitrate down during a lossy patch and back up afterwards.
+     * @param bitrate_kbps New average bitrate in kbps.
+     * @return `true` on success.
+     */
+    bool set_bitrate(uint32_t bitrate_kbps);
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -143,6 +152,15 @@ namespace nvenc {
   private:
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
     uint32_t minimum_api_version = 0;
+
+    // Parameters the encoder was initialized with, kept so set_bitrate() can reconfigure it
+    struct {
+      NV_ENC_INITIALIZE_PARAMS init_params;
+      NV_ENC_CONFIG enc_config;
+      uint32_t framerate = 0;
+      int vbv_percentage_increase = 0;
+      bool valid = false;
+    } reconfig_state;
 
     struct {
       uint64_t last_encoded_frame_index = 0;

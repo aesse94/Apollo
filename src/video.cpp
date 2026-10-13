@@ -414,6 +414,12 @@ namespace video {
       }
     }
 
+    void set_bitrate(int bitrate_kbps) override {
+      if (device && device->nvenc) {
+        device->nvenc->set_bitrate(bitrate_kbps);
+      }
+    }
+
     nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index) {
       if (!device || !device->nvenc) {
         return {};
@@ -1935,6 +1941,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<int>(mail::frogtale_bitrate);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -1980,6 +1987,12 @@ namespace video {
       }
 
       bool requested_idr_frame = false;
+
+      while (bitrate_events->peek()) {
+        if (auto kbps = bitrate_events->pop(0ms)) {
+          session->set_bitrate(*kbps);
+        }
+      }
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
