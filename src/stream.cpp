@@ -4,7 +4,10 @@
  */
 
 // standard includes
+#include <cstring>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <future>
 #include <queue>
 
@@ -247,6 +250,127 @@ namespace stream {
   constexpr std::size_t MAX_AUDIO_PACKET_SIZE = 1400;
 
   using audio_aes_t = std::array<char, round_to_pkcs7_padded(MAX_AUDIO_PACKET_SIZE)>;
+
+  // FrogtaleTV patch: video NACK / retransmit for lossy links.
+  //
+  // Over Starlink the downlink stalls for 30-80 ms every few seconds and drops what was in
+  // flight. Stock Moonlight can only answer with an RFI, which costs a round trip plus an IDR
+  // and visibly stutters; GeForce Now instead NACKs the missing packets and gets them resent.
+  // We keep the last HISTORY sent video packets (already encrypted, exactly as sent) per client
+  // endpoint, and a patched client sends "FTNK" + ranges of missing RTP sequence numbers on the
+  // video socket. Stock clients never send FTNK, so this changes nothing for them.
+  namespace nack {
+    constexpr std::size_t HISTORY = 4096;
+    constexpr std::size_t MAX_RANGES = 64;
+
+    struct history_t {
+      std::mutex mutex;
+      std::uintptr_t native_socket = 0;
+      asio::ip::address address;
+      uint16_t port = 0;
+      asio::ip::address local_address;
+      std::size_t prefixsize = 0;
+      std::size_t blocksize = 0;
+      std::array<uint16_t, HISTORY> seqs {};
+      std::array<bool, HISTORY> valid {};
+      std::vector<char> packets;
+      uint64_t resent = 0;
+      uint64_t unavailable = 0;
+    };
+
+    std::mutex histories_mutex;
+    std::map<udp::endpoint, std::shared_ptr<history_t>> histories;
+
+    std::shared_ptr<history_t> find(const udp::endpoint &peer) {
+      std::lock_guard lg {histories_mutex};
+      auto it = histories.find(peer);
+      return it == histories.end() ? nullptr : it->second;
+    }
+
+    std::shared_ptr<history_t> get_or_create(const udp::endpoint &peer) {
+      std::lock_guard lg {histories_mutex};
+      if (!histories.count(peer) && histories.size() >= 4) {
+        // Each new session uses a new client port; drop stale histories (~6 MB each).
+        for (auto &[endpoint, old] : histories) {
+          BOOST_LOG(info) << "FrogtaleTV NACK: "sv << endpoint.address().to_string() << ':' << endpoint.port()
+                          << " resent "sv << old->resent << ", unavailable "sv << old->unavailable;
+        }
+        histories.clear();
+      }
+      auto &history = histories[peer];
+      if (!history) {
+        history = std::make_shared<history_t>();
+      }
+      return history;
+    }
+
+    // Remember one shard exactly as it went on the wire (prefix + payload).
+    void store(history_t &history, uint16_t seq, const char *prefix, std::size_t prefixsize, const char *data, std::size_t blocksize) {
+      std::lock_guard lg {history.mutex};
+      if (history.prefixsize != prefixsize || history.blocksize != blocksize) {
+        history.prefixsize = prefixsize;
+        history.blocksize = blocksize;
+        history.packets.assign(HISTORY * (prefixsize + blocksize), 0);
+        history.valid.fill(false);
+      }
+      auto slot = seq % HISTORY;
+      auto *dst = &history.packets[slot * (prefixsize + blocksize)];
+      if (prefixsize) {
+        std::memcpy(dst, prefix, prefixsize);
+      }
+      std::memcpy(dst + prefixsize, data, blocksize);
+      history.seqs[slot] = seq;
+      history.valid[slot] = true;
+    }
+
+    // Payload after the "FTNK" magic: uint16 count, then count x (uint16 first, uint16 length), little endian.
+    void handle(const udp::endpoint &peer, const char *payload, std::size_t bytes) {
+      auto history = find(peer);
+      if (!history || bytes < 2) {
+        return;
+      }
+
+      uint16_t count;
+      std::memcpy(&count, payload, sizeof(count));
+      count = std::min<uint16_t>(boost::endian::little_to_native(count), MAX_RANGES);
+      if (bytes < 2 + count * 4u) {
+        return;
+      }
+
+      std::lock_guard lg {history->mutex};
+      for (uint16_t r = 0; r < count; r++) {
+        uint16_t first, length;
+        std::memcpy(&first, payload + 2 + r * 4, sizeof(first));
+        std::memcpy(&length, payload + 4 + r * 4, sizeof(length));
+        first = boost::endian::little_to_native(first);
+        length = std::min<uint16_t>(boost::endian::little_to_native(length), HISTORY / 2);
+
+        for (uint16_t i = 0; i < length; i++) {
+          uint16_t seq = first + i;
+          auto slot = seq % HISTORY;
+          if (!history->valid[slot] || history->seqs[slot] != seq) {
+            history->unavailable++;
+            continue;
+          }
+
+          auto *src = &history->packets[slot * (history->prefixsize + history->blocksize)];
+          auto send_info = platf::send_info_t {
+            history->prefixsize ? src : nullptr,
+            history->prefixsize,
+            src + history->prefixsize,
+            history->blocksize,
+            history->native_socket,
+            history->address,
+            history->port,
+            history->local_address,
+          };
+          platf::send(send_info);
+          history->resent++;
+        }
+      }
+      BOOST_LOG(debug) << "FrogtaleTV NACK: "sv << count << " ranges, total resent "sv << history->resent;
+    }
+  }  // namespace nack
 
   using av_session_id_t = std::variant<asio::ip::address, std::string>;  // IP address or SS-Ping-Payload from RTSP handshake
   using message_queue_t = std::shared_ptr<safe::queue_t<std::pair<udp::endpoint, std::string>>>;
@@ -1293,6 +1417,12 @@ namespace stream {
           return;
         }
 
+        if (buf_elem == 0 && bytes >= 6 && std::memcmp(buf[buf_elem].data(), "FTNK", 4) == 0) {
+          // FrogtaleTV patch: retransmit request from a patched client
+          nack::handle(peer, buf[buf_elem].data() + 4, bytes - 4);
+          return;
+        }
+
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
           auto it = peer_to_session.find(peer.address());
@@ -1508,6 +1638,17 @@ namespace stream {
           frame_fec_latency_logger.second_point_now_and_log();
 
           auto peer_address = session->video.peer.address();
+
+          // FrogtaleTV patch: keep what we send so a patched client can NACK it
+          auto nack_history = nack::get_or_create(session->video.peer);
+          {
+            std::lock_guard lg {nack_history->mutex};
+            nack_history->native_socket = (uintptr_t) sock.native_handle();
+            nack_history->address = peer_address;
+            nack_history->port = session->video.peer.port();
+            nack_history->local_address = session->localAddress;
+          }
+
           auto batch_info = platf::batched_send_info_t {
             shards.headers.begin(),
             shards.prefixsize,
@@ -1569,6 +1710,8 @@ namespace stream {
               std::copy(std::begin(iv), std::end(iv), prefix->iv);
               session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
             }
+
+            nack::store(*nack_history, (uint16_t) (lowseq + x), shards.prefix(x), shards.prefixsize, shards.data(x), shards.blocksize);
 
             if (x - next_shard_to_send + 1 >= send_batch_size ||
                 x + 1 == shards.size()) {
