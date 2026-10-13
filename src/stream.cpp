@@ -5,6 +5,7 @@
 
 // standard includes
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -277,7 +278,26 @@ namespace stream {
       std::vector<char> packets;
       uint64_t resent = 0;
       uint64_t unavailable = 0;
+
+      // Set once this client has sent an FTNK, i.e. it is a patched client that will use duplicates.
+      bool nacking = false;
+      std::deque<std::pair<std::chrono::steady_clock::time_point, uint16_t>> duplicates;
+      uint64_t duplicated = 0;
     };
+
+    // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
+    // the downlink drops what is in flight for 30-80 ms. Sending each packet a second time
+    // DUP_DELAY later, only around those moments, lets the copy land after the stall instead of
+    // the client waiting a full round trip for a NACKed resend (~65 ms to a home host).
+    constexpr auto DUP_DELAY = std::chrono::milliseconds(60);
+    constexpr int64_t WINDOW_BEFORE_MS = 500;
+    constexpr int64_t WINDOW_AFTER_MS = 1000;
+
+    bool in_handoff_window() {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      auto phase = (ms - 12000) % 15000;  // 0 = a handoff
+      return phase >= 15000 - WINDOW_BEFORE_MS || phase <= WINDOW_AFTER_MS;
+    }
 
     std::mutex histories_mutex;
     std::map<udp::endpoint, std::shared_ptr<history_t>> histories;
@@ -294,7 +314,8 @@ namespace stream {
         // Each new session uses a new client port; drop stale histories (~6 MB each).
         for (auto &[endpoint, old] : histories) {
           BOOST_LOG(info) << "FrogtaleTV NACK: "sv << endpoint.address().to_string() << ':' << endpoint.port()
-                          << " resent "sv << old->resent << ", unavailable "sv << old->unavailable;
+                          << " resent "sv << old->resent << ", unavailable "sv << old->unavailable
+                          << ", duplicated "sv << old->duplicated;
         }
         histories.clear();
       }
@@ -322,6 +343,60 @@ namespace stream {
       std::memcpy(dst + prefixsize, data, blocksize);
       history.seqs[slot] = seq;
       history.valid[slot] = true;
+
+      if (history.nacking && in_handoff_window()) {
+        history.duplicates.emplace_back(std::chrono::steady_clock::now() + DUP_DELAY, seq);
+      }
+    }
+
+    void send_slot(history_t &history, uint16_t seq) {
+      auto slot = seq % HISTORY;
+      if (!history.valid[slot] || history.seqs[slot] != seq) {
+        return;
+      }
+      auto *src = &history.packets[slot * (history.prefixsize + history.blocksize)];
+      auto send_info = platf::send_info_t {
+        history.prefixsize ? src : nullptr,
+        history.prefixsize,
+        src + history.prefixsize,
+        history.blocksize,
+        history.native_socket,
+        history.address,
+        history.port,
+        history.local_address,
+      };
+      platf::send(send_info);
+    }
+
+    // Sends due duplicates for every client. One thread for the process, started on first use.
+    void duplicate_thread() {
+      platf::adjust_thread_priority(platf::thread_priority_e::high);
+      while (true) {
+        std::this_thread::sleep_for(1ms);
+        std::vector<std::shared_ptr<history_t>> all;
+        {
+          std::lock_guard lg {histories_mutex};
+          for (auto &[endpoint, history] : histories) {
+            all.push_back(history);
+          }
+        }
+        auto now = std::chrono::steady_clock::now();
+        for (auto &history : all) {
+          std::lock_guard lg {history->mutex};
+          while (!history->duplicates.empty() && history->duplicates.front().first <= now) {
+            send_slot(*history, history->duplicates.front().second);
+            history->duplicates.pop_front();
+            history->duplicated++;
+          }
+        }
+      }
+    }
+
+    void ensure_duplicate_thread() {
+      static std::once_flag once;
+      std::call_once(once, []() {
+        std::thread {duplicate_thread}.detach();
+      });
     }
 
     // Payload after the "FTNK" magic: uint16 count, then count x (uint16 first, uint16 length), little endian.
@@ -338,7 +413,10 @@ namespace stream {
         return;
       }
 
+      ensure_duplicate_thread();
+
       std::lock_guard lg {history->mutex};
+      history->nacking = true;
       for (uint16_t r = 0; r < count; r++) {
         uint16_t first, length;
         std::memcpy(&first, payload + 2 + r * 4, sizeof(first));
@@ -354,22 +432,12 @@ namespace stream {
             continue;
           }
 
-          auto *src = &history->packets[slot * (history->prefixsize + history->blocksize)];
-          auto send_info = platf::send_info_t {
-            history->prefixsize ? src : nullptr,
-            history->prefixsize,
-            src + history->prefixsize,
-            history->blocksize,
-            history->native_socket,
-            history->address,
-            history->port,
-            history->local_address,
-          };
-          platf::send(send_info);
+          send_slot(*history, seq);
           history->resent++;
         }
       }
-      BOOST_LOG(debug) << "FrogtaleTV NACK: "sv << count << " ranges, total resent "sv << history->resent;
+      BOOST_LOG(debug) << "FrogtaleTV NACK: "sv << count << " ranges, total resent "sv << history->resent
+                       << ", duplicated "sv << history->duplicated;
     }
   }  // namespace nack
 
