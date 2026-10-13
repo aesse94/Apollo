@@ -4,6 +4,8 @@
  */
 
 // standard includes
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -295,10 +297,68 @@ namespace stream {
     constexpr int64_t WINDOW_BEFORE_MS = 500;
     constexpr int64_t WINDOW_AFTER_MS = 1000;
 
+    // The fixed schedule above assumes an accurate host clock and that Starlink keeps reconfiguring
+    // at :12/:27/:42/:57. Learn the real moment instead: the client NACKs right after each stall, so
+    // NACK arrival times bunch up at one phase of the 15 s cycle. A decaying histogram of NACK phases
+    // in 100 ms buckets finds that phase. Until it is confident we keep the fixed schedule.
+    constexpr int64_t CYCLE_MS = 15000;
+    constexpr int64_t BUCKET_MS = 100;
+    constexpr int BUCKETS = CYCLE_MS / BUCKET_MS;
+
+    std::mutex phase_mutex;
+    std::array<double, BUCKETS> phase_histogram {};
+    int64_t learned_phase_ms = -1;  // phase of NACK arrivals within the cycle, or -1 = not learned
+
+    int64_t cycle_phase(int64_t epoch_ms) {
+      return ((epoch_ms - 12000) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;  // 0 = scheduled handoff
+    }
+
+    int64_t epoch_now_ms() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    void learn_handoff_phase() {
+      std::lock_guard lg {phase_mutex};
+      for (auto &bucket : phase_histogram) {
+        bucket *= 0.98;
+      }
+      phase_histogram[cycle_phase(epoch_now_ms()) / BUCKET_MS] += 1.0;
+
+      // Sum each bucket with its neighbours, since a stall can straddle a bucket edge
+      double total = 0, best = 0;
+      int best_bucket = -1;
+      for (int b = 0; b < BUCKETS; b++) {
+        total += phase_histogram[b];
+        double around = phase_histogram[(b + BUCKETS - 1) % BUCKETS] + phase_histogram[b] + phase_histogram[(b + 1) % BUCKETS];
+        if (around > best) {
+          best = around;
+          best_bucket = b;
+        }
+      }
+
+      int64_t learned = (best >= 4.0 && best >= 0.4 * total) ? best_bucket * BUCKET_MS + BUCKET_MS / 2 : -1;
+      if ((learned < 0) != (learned_phase_ms < 0) ||
+          (learned >= 0 && std::abs(learned - learned_phase_ms) > 200 && std::abs(learned - learned_phase_ms) < CYCLE_MS - 200)) {
+        if (learned >= 0) {
+          BOOST_LOG(info) << "FrogtaleTV NACK: handoff stalls learned at "sv << learned << " ms into the 15 s cycle (schedule says 0)"sv;
+        } else {
+          BOOST_LOG(info) << "FrogtaleTV NACK: handoff phase no longer clear, using the fixed schedule"sv;
+        }
+      }
+      learned_phase_ms = learned;
+    }
+
     bool in_handoff_window() {
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-      auto phase = (ms - 12000) % 15000;  // 0 = a handoff
-      return phase >= 15000 - WINDOW_BEFORE_MS || phase <= WINDOW_AFTER_MS;
+      auto phase = cycle_phase(epoch_now_ms());
+      int64_t center;
+      {
+        std::lock_guard lg {phase_mutex};
+        // NACKs arrive just after a stall ends, so a learned phase sits slightly late; keep the
+        // window wide enough before it to cover the stall itself.
+        center = learned_phase_ms < 0 ? 0 : learned_phase_ms;
+      }
+      auto d = ((phase - center) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
+      return d >= CYCLE_MS - WINDOW_BEFORE_MS || d <= WINDOW_AFTER_MS;
     }
 
     std::mutex histories_mutex;
@@ -424,6 +484,7 @@ namespace stream {
       }
 
       ensure_duplicate_thread();
+      learn_handoff_phase();
 
       std::lock_guard lg {history->mutex};
       history->nacking = true;
@@ -1715,6 +1776,16 @@ namespace stream {
           // If video encryption is enabled, we allocate space for the encryption header before each shard
           auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
+
+          // FrogtaleTV patch: GeForce Now paces each frame in a few groups at most 1 ms apart
+          // (packetPacing.numGroups 5, maxDelayUs 1000) instead of one burst at line rate, which
+          // overflows queues on a constrained or just-recovered satellite link.
+          if (config::stream.frogtale_pacing_groups > 0) {
+            auto groups = (size_t) config::stream.frogtale_pacing_groups;
+            auto group_size = std::max<size_t>(1, (shards.size() + groups - 1) / groups);
+            ratecontrol_packets_in_1ms = group_size;
+            send_batch_size = std::min(send_batch_size, group_size);
+          }
 
           auto peer_address = session->video.peer.address();
 

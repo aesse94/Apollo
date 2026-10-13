@@ -174,6 +174,9 @@ namespace config {
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
     int wan_encryption_mode;
+
+    // FrogtaleTV patch: send each video FEC block in this many groups 1 ms apart (0 = stock burst)
+    int frogtale_pacing_groups;
   };
 
   struct nvhttp_t {
