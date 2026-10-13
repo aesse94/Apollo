@@ -267,6 +267,7 @@ namespace stream {
     constexpr std::size_t HISTORY = 4096;
     constexpr std::size_t MAX_RANGES = 64;
     constexpr uint16_t BURST_PACKETS = 4;  // a NACK range at least this long is a loss burst
+    constexpr uint16_t LEARN_BURST_PACKETS = 8;  // ... and this long is a stall worth learning from
 
     struct history_t {
       std::mutex mutex;
@@ -351,7 +352,7 @@ namespace stream {
       }
 
       // Off-schedule NACKs (random loss) spread over the cycle; a handoff peak only needs to stand out.
-      int64_t learned = (best >= 3.0 && best >= 0.25 * total) ? best_bucket * BUCKET_MS + BUCKET_MS / 2 : -1;
+      int64_t learned = (best >= 3.0 && best >= 0.5 * total) ? best_bucket * BUCKET_MS + BUCKET_MS / 2 : -1;
 
       // Once a minute, say what we see, so a missed window can be diagnosed from the info log
       static auto last_report = std::chrono::steady_clock::now();
@@ -379,10 +380,14 @@ namespace stream {
         std::lock_guard lg {phase_mutex};
         // NACKs arrive just after a stall ends, so a learned phase sits slightly late; keep the
         // window wide enough before it to cover the stall itself.
-        // The learned phase is logged only. On 2026-10-13 off-schedule loss bursts briefly "taught"
-        // it 10.75 s and 12.85 s and moved the window off the real handoff, while the fixed schedule
-        // matched the Deck's NTP clock to +0.03 s every time.
-        center = 0;
+        // Starlink's stall moment moves: on 2026-10-13 the Deck's NTP clock saw -0.49 s, then +0.03 s,
+        // then -0.81 s, each steady for many minutes. Follow the learned phase (now fed by bursts
+        // only); without one, use the schedule with a wider window.
+        center = learned_phase_ms < 0 ? 0 : learned_phase_ms;
+        if (learned_phase_ms < 0) {
+          auto d0 = ((phase) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
+          return d0 >= CYCLE_MS - 1000 || d0 <= 1000;
+        }
       }
       auto d = ((phase - center) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
       return d >= CYCLE_MS - WINDOW_BEFORE_MS || d <= WINDOW_AFTER_MS;
@@ -554,7 +559,20 @@ namespace stream {
       }
 
       ensure_duplicate_thread();
-      learn_handoff_phase();
+
+      // Learn the handoff phase only from bursts. Every NACK made the histogram noise, but a
+      // handoff stall loses dozens of packets in a row, which random loss almost never does.
+      {
+        uint16_t longest = 0;
+        for (uint16_t r = 0; r < count; r++) {
+          uint16_t length;
+          std::memcpy(&length, payload + 4 + r * 4, sizeof(length));
+          longest = std::max<uint16_t>(longest, boost::endian::little_to_native(length));
+        }
+        if (longest >= LEARN_BURST_PACKETS) {
+          learn_handoff_phase();
+        }
+      }
 
       bool off_window = !in_handoff_window();
 
