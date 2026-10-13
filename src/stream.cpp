@@ -460,7 +460,11 @@ namespace stream {
       history.valid[slot] = true;
       history.sent++;
 
-      if (history.nacking && in_handoff_window()) {
+      // No copies while adaptive bitrate has stepped down: then the link is congested (on 2026-10-13
+      // a movie streamed on the same Starlink and loss stayed 13-42% even at 3.3 Mbps), and tripling
+      // our own traffic in each window only adds to it.
+      bool congested = config::stream.frogtale_adaptive_bitrate && history.base_kbps && history.current_kbps < history.base_kbps;
+      if (history.nacking && !congested && in_handoff_window()) {
         auto now = std::chrono::steady_clock::now();
         for (auto delay : DUP_DELAYS) {
           history.duplicates.emplace_back(now + delay, seq);
