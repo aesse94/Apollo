@@ -266,6 +266,7 @@ namespace stream {
   namespace nack {
     constexpr std::size_t HISTORY = 4096;
     constexpr std::size_t MAX_RANGES = 64;
+    constexpr uint16_t BURST_PACKETS = 4;  // a NACK range at least this long is a loss burst
 
     struct history_t {
       std::mutex mutex;
@@ -565,7 +566,9 @@ namespace stream {
         std::memcpy(&length, payload + 4 + r * 4, sizeof(length));
         first = boost::endian::little_to_native(first);
         length = std::min<uint16_t>(boost::endian::little_to_native(length), HISTORY / 2);
-        if (off_window) {
+        // Only bursts count: scattered single losses (~1-2% on Starlink all the time) are repaired
+        // invisibly by FEC, and counting them pinned the bitrate at its floor on 2026-10-13.
+        if (off_window && length >= BURST_PACKETS) {
           history->nacked_off_window += length;
         }
 
