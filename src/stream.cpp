@@ -287,9 +287,11 @@ namespace stream {
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
     // the downlink drops what is in flight for 30-80 ms. Sending each packet a second time
-    // DUP_DELAY later, only around those moments, lets the copy land after the stall instead of
+    // DUP_DELAYS later, only around those moments, lets a copy land after the stall instead of
     // the client waiting a full round trip for a NACKed resend (~65 ms to a home host).
-    constexpr auto DUP_DELAY = std::chrono::milliseconds(60);
+    // Two copies: hold times with a single 60 ms copy came out at 35-48 ms, i.e. most stalls are only
+    // ~15-25 ms, so a 30 ms copy covers them quickly and the 60 ms one backs up longer stalls.
+    constexpr std::array<std::chrono::milliseconds, 2> DUP_DELAYS {std::chrono::milliseconds(30), std::chrono::milliseconds(60)};
     constexpr int64_t WINDOW_BEFORE_MS = 500;
     constexpr int64_t WINDOW_AFTER_MS = 1000;
 
@@ -345,7 +347,10 @@ namespace stream {
       history.valid[slot] = true;
 
       if (history.nacking && in_handoff_window()) {
-        history.duplicates.emplace_back(std::chrono::steady_clock::now() + DUP_DELAY, seq);
+        auto now = std::chrono::steady_clock::now();
+        for (auto delay : DUP_DELAYS) {
+          history.duplicates.emplace_back(now + delay, seq);
+        }
       }
     }
 
@@ -383,10 +388,15 @@ namespace stream {
         auto now = std::chrono::steady_clock::now();
         for (auto &history : all) {
           std::lock_guard lg {history->mutex};
-          while (!history->duplicates.empty() && history->duplicates.front().first <= now) {
-            send_slot(*history, history->duplicates.front().second);
-            history->duplicates.pop_front();
-            history->duplicated++;
+          auto &queue = history->duplicates;
+          for (auto it = queue.begin(); it != queue.end();) {
+            if (it->first <= now) {
+              send_slot(*history, it->second);
+              history->duplicated++;
+              it = queue.erase(it);
+            } else {
+              ++it;
+            }
           }
         }
       }
