@@ -1,0 +1,55 @@
+name: Frogtale Windows
+
+# Builds the statically linked sunshine.exe described in FROGTALE.md, so a branch can be tried on the
+# host without a local MSYS2 setup: download the artifact and swap it for sunshine.exe in an Apollo
+# 0.4.6 install (keep the original).
+
+on:
+  push:
+    branches:
+      - frogtale-starlink
+      - 'claude/**'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nlohmann_json
+            mingw-w64-ucrt-x86_64-nodejs
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          ninja -C build sunshine
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-${{ github.sha }}
+          path: build/sunshine.exe
