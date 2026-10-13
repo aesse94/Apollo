@@ -22,7 +22,8 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 
-#ifdef __MINGW32__
+// Newer mingw-w64 headers (v12+) declare the synthetic pointer API themselves.
+#if defined(__MINGW32__) && __MINGW64_VERSION_MAJOR < 12
 DECLARE_HANDLE(HSYNTHETICPOINTERDEVICE);
 WINUSERAPI HSYNTHETICPOINTERDEVICE WINAPI CreateSyntheticPointerDevice(POINTER_INPUT_TYPE pointerType, ULONG maxCount, POINTER_FEEDBACK_MODE mode);
 WINUSERAPI BOOL WINAPI InjectSyntheticPointerInput(HSYNTHETICPOINTERDEVICE device, CONST POINTER_TYPE_INFO *pointerInfo, UINT32 count);

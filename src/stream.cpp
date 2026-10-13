@@ -13,6 +13,7 @@
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
+#include <boost/endian/conversion.hpp>
 #include <openssl/err.h>
 
 extern "C" {
