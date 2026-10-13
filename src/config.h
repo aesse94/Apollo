@@ -180,6 +180,10 @@ namespace config {
 
     // FrogtaleTV patch: lower the bitrate during lossy patches reported by NACKs (0 = off)
     int frogtale_adaptive_bitrate;
+
+    // FrogtaleTV patch: with adaptive bitrate, also step down when a patched client reports this much
+    // queueing delay in ms ("FTDL"), before the queue overflows into loss (0 = loss only)
+    int frogtale_delay_ms;
   };
 
   struct nvhttp_t {

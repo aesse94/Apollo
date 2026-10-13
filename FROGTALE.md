@@ -16,6 +16,13 @@ no change in behaviour.
   a round trip for a NACK. The cost is about 20% extra video bandwidth, all inside those windows. This
   relies on an accurate host clock: Windows' default sync interval is several hours, so a shorter
   `SpecialPollInterval` is recommended.
+- **Delay-based step-down (`frogtale_delay_ms`, default 30, needs `frogtale_adaptive_bitrate = 1`):**
+  a patched client sends `"FTDL"`, `uint16 queue_ms`, `uint16 samples` (little endian) every 250 ms:
+  the median one-way delay of new frames over its 6 s minimum, i.e. how much queue is building on
+  the path. Two reports in a row at or over the threshold, outside handoff windows, step the bitrate
+  down 15% (40% at 4x the threshold), at most once a second. Climbing only counts a second as clean
+  when the queue also stayed under half the threshold. This is how GeForce Now (WebRTC) backs off
+  when something else fills the link, before the queue overflows into loss. `0` = loss only.
 - **Build fixes for current MSYS2 (GCC 16, mingw-w64 v12+):** a `boost/endian/conversion.hpp`
   include, and the synthetic pointer API declared only for older headers.
 
