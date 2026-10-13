@@ -311,6 +311,7 @@ namespace stream {
     constexpr std::array<std::chrono::milliseconds, 2> DUP_DELAYS {std::chrono::milliseconds(40), std::chrono::milliseconds(80)};
     constexpr int64_t WINDOW_BEFORE_MS = 700;
     constexpr int64_t WINDOW_AFTER_MS = 700;
+    constexpr int64_t SCHEDULE_WINDOW_MS = 1200;  // around the schedule: covers +-1 s shifts plus the stall
 
     // The fixed schedule above assumes an accurate host clock and that Starlink keeps reconfiguring
     // at :12/:27/:42/:57. Learn the real moment instead: the client NACKs right after each stall, so
@@ -334,8 +335,14 @@ namespace stream {
 
     void learn_handoff_phase() {
       std::lock_guard lg {phase_mutex};
+      // Halve old evidence every 45 s, so a shifted stall moment takes over within a few handoffs
+      static auto last_learn = std::chrono::steady_clock::now();
+      auto now = std::chrono::steady_clock::now();
+      double age_s = std::chrono::duration<double>(now - last_learn).count();
+      last_learn = now;
+      double decay = std::pow(0.5, age_s / 45.0);
       for (auto &bucket : phase_histogram) {
-        bucket *= 0.98;
+        bucket *= decay;
       }
       phase_histogram[cycle_phase(epoch_now_ms()) / BUCKET_MS] += 1.0;
 
@@ -384,9 +391,12 @@ namespace stream {
         // then -0.81 s, each steady for many minutes. Follow the learned phase (now fed by bursts
         // only); without one, use the schedule with a wider window.
         center = learned_phase_ms < 0 ? 0 : learned_phase_ms;
-        if (learned_phase_ms < 0) {
-          auto d0 = ((phase) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
-          return d0 >= CYCLE_MS - 1000 || d0 <= 1000;
+        // Every shift seen so far stayed within +-1 s of the schedule. While the learned phase is in
+        // that range, cover the whole range, so a shift needs no relearning (a 1-minute rough patch
+        // at 12:13 on 2026-10-13 was the window narrowed on the old phase).
+        auto off_schedule = std::min(center, CYCLE_MS - center);
+        if (learned_phase_ms < 0 || off_schedule <= 1000) {
+          return phase >= CYCLE_MS - SCHEDULE_WINDOW_MS || phase <= SCHEDULE_WINDOW_MS;
         }
       }
       auto d = ((phase - center) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
