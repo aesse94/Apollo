@@ -403,6 +403,17 @@ namespace stream {
       return d >= CYCLE_MS - WINDOW_BEFORE_MS || d <= WINDOW_AFTER_MS;
     }
 
+    // Close to a confidently learned stall moment: worth a third, later copy. Some handoff holds on
+    // 2026-10-13 still took 60-91 ms, i.e. stalls outlasted the 80 ms copy.
+    bool in_core_window() {
+      std::lock_guard lg {phase_mutex};
+      if (learned_phase_ms < 0) {
+        return false;
+      }
+      auto d = ((cycle_phase(epoch_now_ms()) - learned_phase_ms) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
+      return d >= CYCLE_MS - 500 || d <= 500;
+    }
+
     std::mutex histories_mutex;
     std::map<udp::endpoint, std::shared_ptr<history_t>> histories;
 
@@ -453,6 +464,9 @@ namespace stream {
         auto now = std::chrono::steady_clock::now();
         for (auto delay : DUP_DELAYS) {
           history.duplicates.emplace_back(now + delay, seq);
+        }
+        if (in_core_window()) {
+          history.duplicates.emplace_back(now + std::chrono::milliseconds(120), seq);
         }
       }
     }
@@ -507,7 +521,8 @@ namespace stream {
         target = std::max(history.base_kbps / 4, history.current_kbps * 7 / 10);
         history.clean_seconds = 0;
       } else if (loss < 0.002) {
-        if (++history.clean_seconds >= 5 && history.current_kbps < history.base_kbps) {
+        // 8 clean seconds per step (was 5): the climb bounced down and up 120 times in one session
+        if (++history.clean_seconds >= 8 && history.current_kbps < history.base_kbps) {
           target = std::min(history.base_kbps, std::max(history.current_kbps * 11 / 10, history.current_kbps + 500));
           history.clean_seconds = 0;
         }
