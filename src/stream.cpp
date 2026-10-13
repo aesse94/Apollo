@@ -497,8 +497,14 @@ namespace stream {
 
       double loss = (double) nacked / (double) sent;
       int target = history.current_kbps;
-      if (loss > 0.01) {
-        target = std::max(history.base_kbps / 2, history.current_kbps * 7 / 10);
+      // A Starlink storm on 2026-10-13 12:37 lost 12-42% of packets for ~30 s; at the old 50% floor
+      // (6.7 Mbps) that still stuttered constantly. GeForce Now's floor is 1 Mbps
+      // (minimumBitrateKbps 1000). Step hard on heavy loss and allow down to a quarter.
+      if (loss > 0.10) {
+        target = std::max(history.base_kbps / 4, history.current_kbps * 4 / 10);
+        history.clean_seconds = 0;
+      } else if (loss > 0.01) {
+        target = std::max(history.base_kbps / 4, history.current_kbps * 7 / 10);
         history.clean_seconds = 0;
       } else if (loss < 0.002) {
         if (++history.clean_seconds >= 5 && history.current_kbps < history.base_kbps) {
