@@ -293,9 +293,11 @@ namespace stream {
     // the client waiting a full round trip for a NACKed resend (~65 ms to a home host).
     // Two copies: hold times with a single 60 ms copy came out at 35-48 ms, i.e. most stalls are only
     // ~15-25 ms, so a 30 ms copy covers them quickly and the 60 ms one backs up longer stalls.
-    constexpr std::array<std::chrono::milliseconds, 2> DUP_DELAYS {std::chrono::milliseconds(30), std::chrono::milliseconds(60)};
-    constexpr int64_t WINDOW_BEFORE_MS = 1000;
-    constexpr int64_t WINDOW_AFTER_MS = 1000;
+    // 2026-10-13 daytime stalls ran ~60-80 ms (holds 22-75 ms even with copies at 30/60), which
+    // swallowed both copies; 40/80 still covers short stalls with the first copy.
+    constexpr std::array<std::chrono::milliseconds, 2> DUP_DELAYS {std::chrono::milliseconds(40), std::chrono::milliseconds(80)};
+    constexpr int64_t WINDOW_BEFORE_MS = 700;
+    constexpr int64_t WINDOW_AFTER_MS = 700;
 
     // The fixed schedule above assumes an accurate host clock and that Starlink keeps reconfiguring
     // at :12/:27/:42/:57. Learn the real moment instead: the client NACKs right after each stall, so
@@ -365,7 +367,10 @@ namespace stream {
         std::lock_guard lg {phase_mutex};
         // NACKs arrive just after a stall ends, so a learned phase sits slightly late; keep the
         // window wide enough before it to cover the stall itself.
-        center = learned_phase_ms < 0 ? 0 : learned_phase_ms;
+        // The learned phase is logged only. On 2026-10-13 off-schedule loss bursts briefly "taught"
+        // it 10.75 s and 12.85 s and moved the window off the real handoff, while the fixed schedule
+        // matched the Deck's NTP clock to +0.03 s every time.
+        center = 0;
       }
       auto d = ((phase - center) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;
       return d >= CYCLE_MS - WINDOW_BEFORE_MS || d <= WINDOW_AFTER_MS;
