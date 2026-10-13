@@ -294,7 +294,7 @@ namespace stream {
     // Two copies: hold times with a single 60 ms copy came out at 35-48 ms, i.e. most stalls are only
     // ~15-25 ms, so a 30 ms copy covers them quickly and the 60 ms one backs up longer stalls.
     constexpr std::array<std::chrono::milliseconds, 2> DUP_DELAYS {std::chrono::milliseconds(30), std::chrono::milliseconds(60)};
-    constexpr int64_t WINDOW_BEFORE_MS = 500;
+    constexpr int64_t WINDOW_BEFORE_MS = 1000;
     constexpr int64_t WINDOW_AFTER_MS = 1000;
 
     // The fixed schedule above assumes an accurate host clock and that Starlink keeps reconfiguring
@@ -336,7 +336,17 @@ namespace stream {
         }
       }
 
-      int64_t learned = (best >= 4.0 && best >= 0.4 * total) ? best_bucket * BUCKET_MS + BUCKET_MS / 2 : -1;
+      // Off-schedule NACKs (random loss) spread over the cycle; a handoff peak only needs to stand out.
+      int64_t learned = (best >= 3.0 && best >= 0.25 * total) ? best_bucket * BUCKET_MS + BUCKET_MS / 2 : -1;
+
+      // Once a minute, say what we see, so a missed window can be diagnosed from the info log
+      static auto last_report = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() - last_report > std::chrono::minutes(1)) {
+        last_report = std::chrono::steady_clock::now();
+        BOOST_LOG(info) << "FrogtaleTV NACK: phase peak "sv << best_bucket * BUCKET_MS + BUCKET_MS / 2 << " ms holds "sv
+                        << (int) (100 * best / std::max(total, 1e-9)) << "% of NACKs (weight "sv << best << "), using "sv
+                        << (learned >= 0 ? learned : 0) << " ms"sv << (learned >= 0 ? "" : " (fixed schedule)");
+      }
       if ((learned < 0) != (learned_phase_ms < 0) ||
           (learned >= 0 && std::abs(learned - learned_phase_ms) > 200 && std::abs(learned - learned_phase_ms) < CYCLE_MS - 200)) {
         if (learned >= 0) {
