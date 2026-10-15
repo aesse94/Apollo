@@ -279,6 +279,7 @@ namespace stream {
       std::size_t blocksize = 0;
       std::array<uint16_t, HISTORY> seqs {};
       std::array<bool, HISTORY> valid {};
+      std::array<bool, HISTORY> loss_counted {};  // this slot's packet already counted as lost once
       std::vector<char> packets;
       uint64_t resent = 0;
       uint64_t unavailable = 0;
@@ -305,6 +306,7 @@ namespace stream {
       int fec_boost = 0;  // FEC percentage to use instead of the configured one, 0 = configured
       int fec_clean_seconds = 0;
       int mild_loss_seconds = 0;  // consecutive seconds of 1-3% loss
+      int lossy_seconds = 0;  // consecutive seconds over 3% loss
 
       // Delay-based step-down (frogtale_delay_ms): queueing delay reported by the client ("FTDL")
       uint64_t delay_reports = 0;
@@ -480,6 +482,7 @@ namespace stream {
       std::memcpy(dst + prefixsize, data, blocksize);
       history.seqs[slot] = seq;
       history.valid[slot] = true;
+      history.loss_counted[slot] = false;
       history.sent++;
 
       // No copies while adaptive bitrate has stepped down: then the link is congested (on 2026-10-13
@@ -578,21 +581,34 @@ namespace stream {
       // A Starlink storm on 2026-10-13 12:37 lost 12-42% of packets for ~30 s; at the old 50% floor
       // (6.7 Mbps) that still stuttered constantly. GeForce Now's floor is 1 Mbps
       // (minimumBitrateKbps 1000). Step hard on heavy loss and allow down to a quarter.
-      if (loss > 0.10) {
-        target = std::max(history.base_kbps / 8, history.current_kbps * 4 / 10);
+      // A fade (rain, an obstruction, a stall outside the schedule) loses nearly everything for
+      // ~1 s and then the link is fine again; a lower bitrate doesn't make it fade less. On the
+      // evening of 2026-10-15 (heavy rain) each fade cut 13.4 -> 1.7 Mbps within 2 s and took 15-30 s
+      // to climb back, every 1-3 minutes, while GeForce Now on the same link held its rate. Like it,
+      // react to loss that persists: one lossy second only stops the climb (FEC is already boosted
+      // above); 2 s over 10% cuts 40%, 3 s over 3% (or 1-3% for 3 s) cuts 15%; at most one cut per
+      // 2 s from any signal. Loss alone goes no lower than a third of the base unless it lasts 5 s
+      // (the 2026-10-13 12:37 storm lost 12-42% for ~30 s and did need the floor).
+      history.lossy_seconds = loss > 0.03 ? history.lossy_seconds + 1 : 0;
+      bool can_cut = now - history.last_cut >= std::chrono::seconds(2);
+      int loss_floor = history.lossy_seconds >= 5 ? history.base_kbps / 8 : history.base_kbps / 3;
+      if (loss > 0.10 && history.lossy_seconds >= 2) {
+        if (can_cut) {
+          target = std::max(std::min(loss_floor, history.current_kbps), history.current_kbps * 6 / 10);
+          history.last_cut = now;
+        }
         history.clean_seconds = 0;
-        history.queue_ceiling_kbps = history.current_kbps;
-        history.last_cut = now;
-      } else if (loss > 0.03 || (loss > 0.01 && ++history.mild_loss_seconds >= 3)) {
+      } else if (history.lossy_seconds >= 3 || (loss > 0.01 && ++history.mild_loss_seconds >= 3)) {
         // 1-3% for a single second is a Starlink blip that the FEC boost above already repairs;
         // cutting for it made the picture go soft for 10-15 s at a time (2026-10-15 11:26-11:29).
-        // GeForce Now holds its rate through small loss. Cut on > 3%, or 1-3% for 3 s in a row.
-        target = std::max(history.base_kbps / 8, history.current_kbps * 7 / 10);
+        if (can_cut) {
+          target = std::max(std::min(loss_floor, history.current_kbps), history.current_kbps * 85 / 100);
+          history.mild_loss_seconds = 0;
+          // Sustained loss is a capacity problem: climb back slowly near here (see below)
+          history.queue_ceiling_kbps = history.current_kbps;
+          history.last_cut = now;
+        }
         history.clean_seconds = 0;
-        history.mild_loss_seconds = 0;
-        // 16:05:52 and 16:06:12 on 2026-10-15: loss cuts to 9.4 Mbps were back at 13.4 in 4 s
-        history.queue_ceiling_kbps = history.current_kbps;
-        history.last_cut = now;
       } else if (loss > 0.01) {
         history.clean_seconds = 0;
       } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < config::stream.frogtale_delay_ms)) {
@@ -694,6 +710,11 @@ namespace stream {
       if (++history->delay_over_streak < 2 || now - history->last_delay_step < std::chrono::seconds(1)) {
         return;
       }
+      // Just after a fade the backlog drains through the link and reads as a 100-200 ms queue;
+      // 18:58:28 and 18:59:28 on 2026-10-15 cut for that on top of the loss cut in the same second.
+      if (now - history->last_cut < std::chrono::seconds(2)) {
+        return;
+      }
       history->delay_over_streak = 0;
       history->last_delay_step = now;
       history->clean_seconds = 0;
@@ -783,19 +804,22 @@ namespace stream {
         length = std::min<uint16_t>(boost::endian::little_to_native(length), HISTORY / 2);
         // Only bursts count: scattered single losses (~1-2% on Starlink all the time) are repaired
         // invisibly by FEC, and counting them pinned the bitrate at its floor on 2026-10-13.
-        if (off_window && length >= BURST_PACKETS) {
-          history->nacked_off_window += length;
-        }
-        if (off_window) {
-          history->nacked_all_off_window += length;
-        }
-
+        // Each packet counts once: the client re-NACKs what is still missing twice, so counting
+        // every range read a 1 s rain fade as 120-215% "loss" (2026-10-15 evening) and slammed
+        // the bitrate to its floor. Packets we no longer hold (or never sent) don't count either.
         for (uint16_t i = 0; i < length; i++) {
           uint16_t seq = first + i;
           auto slot = seq % HISTORY;
           if (!history->valid[slot] || history->seqs[slot] != seq) {
             history->unavailable++;
             continue;
+          }
+          if (off_window && !history->loss_counted[slot]) {
+            history->loss_counted[slot] = true;
+            history->nacked_all_off_window++;
+            if (length >= BURST_PACKETS) {
+              history->nacked_off_window++;
+            }
           }
 
           send_slot(*history, seq);
