@@ -299,6 +299,12 @@ namespace stream {
       uint64_t last_nacked = 0;
       std::chrono::steady_clock::time_point last_eval;
 
+      // Adaptive FEC: all NACKed packets (bursts and scattered) outside handoff windows
+      uint64_t nacked_all_off_window = 0;
+      uint64_t last_nacked_all = 0;
+      int fec_boost = 0;  // FEC percentage to use instead of the configured one, 0 = configured
+      int fec_clean_seconds = 0;
+
       // Delay-based step-down (frogtale_delay_ms): queueing delay reported by the client ("FTDL")
       uint64_t delay_reports = 0;
       int delay_over_streak = 0;
@@ -528,6 +534,27 @@ namespace stream {
       }
 
       double loss = (double) nacked / (double) sent;
+
+      // Rain loses packets here and there rather than whole frames, which FEC repairs on the
+      // client with no round trip. GeForce Now raises FEC during lossy periods
+      // (bwe.fecLimitForBitrateIncrease 40); the bitrate usually steps down at the same time, so
+      // the total stays similar.
+      double loss_all = (double) (history.nacked_all_off_window - history.last_nacked_all) / (double) sent;
+      history.last_nacked_all = history.nacked_all_off_window;
+      int fec = loss_all > 0.04 ? 60 : loss_all > 0.01 ? 40 : 0;
+      if (fec > history.fec_boost) {
+        history.fec_boost = fec;
+        history.fec_clean_seconds = 0;
+        BOOST_LOG(info) << "FrogtaleTV FEC: loss "sv << (int) (loss_all * 1000) / 10.0 << "% -> "sv << fec << "%"sv;
+      } else if (history.fec_boost && loss_all < 0.003) {
+        if (++history.fec_clean_seconds >= 8) {
+          history.fec_boost = history.fec_boost > 40 ? 40 : 0;
+          history.fec_clean_seconds = 0;
+          BOOST_LOG(info) << "FrogtaleTV FEC: clean -> "sv << (history.fec_boost ? history.fec_boost : config::stream.fec_percentage) << "%"sv;
+        }
+      } else {
+        history.fec_clean_seconds = 0;
+      }
       int delay_max_ms = history.delay_max_ms;
       history.delay_max_ms = 0;
       int target = history.current_kbps;
@@ -689,6 +716,9 @@ namespace stream {
         // invisibly by FEC, and counting them pinned the bitrate at its floor on 2026-10-13.
         if (off_window && length >= BURST_PACKETS) {
           history->nacked_off_window += length;
+        }
+        if (off_window) {
+          history->nacked_all_off_window += length;
         }
 
         for (uint16_t i = 0; i < length; i++) {
@@ -1872,6 +1902,10 @@ namespace stream {
       }
 
       auto fecPercentage = config::stream.fec_percentage;
+      if (auto fec_history = nack::find(session->video.peer)) {
+        std::lock_guard lg {fec_history->mutex};
+        fecPercentage = std::max(fecPercentage, fec_history->fec_boost);
+      }
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
