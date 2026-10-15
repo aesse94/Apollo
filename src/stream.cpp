@@ -535,17 +535,24 @@ namespace stream {
       // (6.7 Mbps) that still stuttered constantly. GeForce Now's floor is 1 Mbps
       // (minimumBitrateKbps 1000). Step hard on heavy loss and allow down to a quarter.
       if (loss > 0.10) {
-        target = std::max(history.base_kbps / 4, history.current_kbps * 4 / 10);
+        target = std::max(history.base_kbps / 8, history.current_kbps * 4 / 10);
         history.clean_seconds = 0;
       } else if (loss > 0.01) {
-        target = std::max(history.base_kbps / 4, history.current_kbps * 7 / 10);
+        target = std::max(history.base_kbps / 8, history.current_kbps * 7 / 10);
         history.clean_seconds = 0;
       } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < config::stream.frogtale_delay_ms / 2)) {
         // 8 clean seconds per step (was 5): the climb bounced down and up 120 times in one session.
         // With delay reports, a second only counts as clean if the queue also stayed under half the
         // threshold, so the climb stops where the link starts queueing instead of where it drops.
-        if (++history.clean_seconds >= 8 && history.current_kbps < history.base_kbps) {
-          target = std::min(history.base_kbps, std::max(history.current_kbps * 11 / 10, history.current_kbps + 500));
+        // GeForce Now on 2026-10-13 (movie on the same Starlink): its bitrate sat at ~1.7 Mbps for
+        // minutes, then climbed back to 12 Mbps within seconds, with RTD flat at 35-45 ms. With delay
+        // reports confirming an empty queue, climb like that (+20% every 4 s); on loss alone, keep
+        // the cautious 8 s / +10%.
+        bool queue_known_empty = history.delay_reports && config::stream.frogtale_delay_ms;
+        int need = queue_known_empty ? 4 : 8;
+        if (++history.clean_seconds >= need && history.current_kbps < history.base_kbps) {
+          int step = queue_known_empty ? history.current_kbps / 5 : history.current_kbps / 10;
+          target = std::min(history.base_kbps, std::max(history.current_kbps + step, history.current_kbps + 500));
           history.clean_seconds = 0;
         }
       } else {
