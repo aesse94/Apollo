@@ -280,6 +280,7 @@ namespace stream {
       std::array<uint16_t, HISTORY> seqs {};
       std::array<bool, HISTORY> valid {};
       std::array<bool, HISTORY> loss_counted {};  // this slot's packet already counted as lost once
+      std::array<bool, HISTORY> sent_in_window {};  // sent inside a handoff window: its loss is the handoff's
       std::vector<char> packets;
       uint64_t resent = 0;
       uint64_t unavailable = 0;
@@ -316,12 +317,6 @@ namespace stream {
       int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
       std::chrono::steady_clock::time_point last_cut;
 
-      // Handoff copies scale with how the last handoff window went: 2 = 40/80 ms (+120 in the core
-      // window), 1 = one copy at 60 ms, 0 = none. Judged by the worst queueing delay the client
-      // reported inside the window.
-      int dup_level = 2;
-      bool window_open = false;
-      int window_max_queue_ms = 0;
     };
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
@@ -483,23 +478,24 @@ namespace stream {
       history.seqs[slot] = seq;
       history.valid[slot] = true;
       history.loss_counted[slot] = false;
+      bool in_window = in_handoff_window();
+      history.sent_in_window[slot] = in_window;
       history.sent++;
 
       // No copies while adaptive bitrate has stepped down: then the link is congested (on 2026-10-13
       // a movie streamed on the same Starlink and loss stayed 13-42% even at 3.3 Mbps), and tripling
       // our own traffic in each window only adds to it.
       bool congested = config::stream.frogtale_adaptive_bitrate && history.base_kbps && history.current_kbps < history.base_kbps;
-      if (history.nacking && !congested && history.dup_level > 0 && in_handoff_window()) {
+      // 2026-10-15 16:13-19:10 tried fewer copies after a window that queued (theory: our 3-4x
+      // traffic was adding to the queue). It measured the other way: timeouts per handoff 0.04 with
+      // full copies, 0.10 with one, 0.23 with none. Copies stay on.
+      if (history.nacking && !congested && in_window) {
         auto now = std::chrono::steady_clock::now();
-        if (history.dup_level == 1) {
-          history.duplicates.emplace_back(now + std::chrono::milliseconds(60), seq);
-        } else {
-          for (auto delay : DUP_DELAYS) {
-            history.duplicates.emplace_back(now + delay, seq);
-          }
-          if (in_core_window()) {
-            history.duplicates.emplace_back(now + std::chrono::milliseconds(120), seq);
-          }
+        for (auto delay : DUP_DELAYS) {
+          history.duplicates.emplace_back(now + delay, seq);
+        }
+        if (in_core_window()) {
+          history.duplicates.emplace_back(now + std::chrono::milliseconds(120), seq);
         }
       }
     }
@@ -674,28 +670,7 @@ namespace stream {
       history->delay_reports++;
       if (!off_window) {
         history->delay_over_streak = 0;
-        history->window_open = true;
-        history->window_max_queue_ms = std::max<int>(history->window_max_queue_ms, queue_ms);
         return;
-      }
-      if (history->window_open) {
-        // A handoff window just ended. On a calm link the copies make handoffs nearly invisible
-        // (median pause 64 -> 9 ms, 2026-10-13). On 2026-10-15 15:55-16:11 the link was congested
-        // and nearly every 60-200 ms queue reading fell inside a window, i.e. 3-4x our traffic for
-        // 2.4 s of every 15 was adding to the queue it was meant to beat. Step down a level after a
-        // window that queued 80 ms or more, back up after one under 40 ms.
-        history->window_open = false;
-        int level = history->dup_level;
-        if (history->window_max_queue_ms >= 80 && level > 0) {
-          level--;
-        } else if (history->window_max_queue_ms < 40 && level < 2) {
-          level++;
-        }
-        if (level != history->dup_level) {
-          BOOST_LOG(info) << "FrogtaleTV DUP: window queue "sv << history->window_max_queue_ms << " ms -> copies level "sv << level;
-          history->dup_level = level;
-        }
-        history->window_max_queue_ms = 0;
       }
       history->delay_max_ms = std::max<int>(history->delay_max_ms, queue_ms);
 
@@ -792,8 +767,6 @@ namespace stream {
         }
       }
 
-      bool off_window = !in_handoff_window();
-
       std::lock_guard lg {history->mutex};
       history->nacking = true;
       for (uint16_t r = 0; r < count; r++) {
@@ -807,6 +780,9 @@ namespace stream {
         // Each packet counts once: the client re-NACKs what is still missing twice, so counting
         // every range read a 1 s rain fade as 120-215% "loss" (2026-10-15 evening) and slammed
         // the bitrate to its floor. Packets we no longer hold (or never sent) don't count either.
+        // Whether a loss belongs to a handoff goes by when the packet was SENT: at 18:58:27 a
+        // handoff stall's NACKs and re-NACKs arrived just after the window closed, were taken for
+        // ordinary loss, and cut 13.4 -> 1.7 Mbps.
         for (uint16_t i = 0; i < length; i++) {
           uint16_t seq = first + i;
           auto slot = seq % HISTORY;
@@ -814,7 +790,7 @@ namespace stream {
             history->unavailable++;
             continue;
           }
-          if (off_window && !history->loss_counted[slot]) {
+          if (!history->sent_in_window[slot] && !history->loss_counted[slot]) {
             history->loss_counted[slot] = true;
             history->nacked_all_off_window++;
             if (length >= BURST_PACKETS) {
