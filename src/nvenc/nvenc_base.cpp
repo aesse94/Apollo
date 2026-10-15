@@ -86,6 +86,15 @@ namespace {
 
 namespace nvenc {
 
+  // FrogtaleTV patch: with the stock 5 reference frames an RFI can only cover 55 ms at 90 fps, so
+  // over Starlink almost every loss (a 30-80 ms stall plus a ~65 ms round trip before the request
+  // arrives) became "rfi request too large, generating IDR": a big keyframe burst that rain then
+  // often hit too. 16 (the HEVC maximum here) covers ~178 ms, so recovery is a small P-frame
+  // referencing the last good frame, which is what GeForce Now gets from intra-refresh recovery.
+  static uint32_t frogtale_ref_frames() {
+    return config::stream.frogtale_ref_frames > 0 ? (uint32_t) config::stream.frogtale_ref_frames : 5;
+  }
+
   nvenc_base::nvenc_base(NV_ENC_DEVICE_TYPE device_type):
       device_type(device_type) {
   }
@@ -273,6 +282,7 @@ namespace nvenc {
         encoder_params.rfi = false;
       }
       encoder_params.ref_frames_in_dpb = ref_frames_option;
+      BOOST_LOG(info) << "FrogtaleTV: NvEnc reference frames for RFI: " << ref_frames_option << (encoder_params.rfi ? "" : " (RFI unsupported)");
       // This limits ref frames any frame can use to 1, but allows larger buffer size for fallback if some frames are invalidated through rfi
       L0_option = NV_ENC_NUM_REF_FRAMES_1;
     };
@@ -310,7 +320,7 @@ namespace nvenc {
           } else {
             format_config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
           }
-          set_ref_frames(format_config.maxNumRefFrames, format_config.numRefL0, 5);
+          set_ref_frames(format_config.maxNumRefFrames, format_config.numRefL0, frogtale_ref_frames());
           set_minqp_if_enabled(config.min_qp_h264);
           fill_h264_hevc_vui(format_config.h264VUIParameters);
           break;
@@ -324,7 +334,7 @@ namespace nvenc {
           if (buffer_is_10bit()) {
             format_config.pixelBitDepthMinus8 = 2;
           }
-          set_ref_frames(format_config.maxNumRefFramesInDPB, format_config.numRefL0, 5);
+          set_ref_frames(format_config.maxNumRefFramesInDPB, format_config.numRefL0, frogtale_ref_frames());
           set_minqp_if_enabled(config.min_qp_hevc);
           fill_h264_hevc_vui(format_config.hevcVUIParameters);
           if (client_config.enableIntraRefresh == 1) {

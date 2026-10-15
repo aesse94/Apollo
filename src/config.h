@@ -184,6 +184,9 @@ namespace config {
     // FrogtaleTV patch: with adaptive bitrate, also step down when a patched client reports this much
     // queueing delay in ms ("FTDL"), before the queue overflows into loss (0 = loss only)
     int frogtale_delay_ms;
+
+    // FrogtaleTV patch: reference frames kept for RFI recovery (0 = stock 5)
+    int frogtale_ref_frames;
   };
 
   struct nvhttp_t {
