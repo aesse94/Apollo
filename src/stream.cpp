@@ -304,6 +304,7 @@ namespace stream {
       uint64_t last_nacked_all = 0;
       int fec_boost = 0;  // FEC percentage to use instead of the configured one, 0 = configured
       int fec_clean_seconds = 0;
+      int mild_loss_seconds = 0;  // consecutive seconds of 1-3% loss
 
       // Delay-based step-down (frogtale_delay_ms): queueing delay reported by the client ("FTDL")
       uint64_t delay_reports = 0;
@@ -558,14 +559,23 @@ namespace stream {
       int delay_max_ms = history.delay_max_ms;
       history.delay_max_ms = 0;
       int target = history.current_kbps;
+      if (loss <= 0.01) {
+        history.mild_loss_seconds = 0;
+      }
       // A Starlink storm on 2026-10-13 12:37 lost 12-42% of packets for ~30 s; at the old 50% floor
       // (6.7 Mbps) that still stuttered constantly. GeForce Now's floor is 1 Mbps
       // (minimumBitrateKbps 1000). Step hard on heavy loss and allow down to a quarter.
       if (loss > 0.10) {
         target = std::max(history.base_kbps / 8, history.current_kbps * 4 / 10);
         history.clean_seconds = 0;
-      } else if (loss > 0.01) {
+      } else if (loss > 0.03 || (loss > 0.01 && ++history.mild_loss_seconds >= 3)) {
+        // 1-3% for a single second is a Starlink blip that the FEC boost above already repairs;
+        // cutting for it made the picture go soft for 10-15 s at a time (2026-10-15 11:26-11:29).
+        // GeForce Now holds its rate through small loss. Cut on > 3%, or 1-3% for 3 s in a row.
         target = std::max(history.base_kbps / 8, history.current_kbps * 7 / 10);
+        history.clean_seconds = 0;
+        history.mild_loss_seconds = 0;
+      } else if (loss > 0.01) {
         history.clean_seconds = 0;
       } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < config::stream.frogtale_delay_ms / 2)) {
         // 8 clean seconds per step (was 5): the climb bounced down and up 120 times in one session.
