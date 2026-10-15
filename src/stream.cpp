@@ -311,7 +311,15 @@ namespace stream {
       int delay_over_streak = 0;
       int delay_max_ms = 0;  // highest report since the last evaluation, to gate climbing
       std::chrono::steady_clock::time_point last_delay_step;
-      int queue_ceiling_kbps = 0;  // rate the last delay step-down started from; climbs near it go slowly
+      int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
+      std::chrono::steady_clock::time_point last_cut;
+
+      // Handoff copies scale with how the last handoff window went: 2 = 40/80 ms (+120 in the core
+      // window), 1 = one copy at 60 ms, 0 = none. Judged by the worst queueing delay the client
+      // reported inside the window.
+      int dup_level = 2;
+      bool window_open = false;
+      int window_max_queue_ms = 0;
     };
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
@@ -478,13 +486,17 @@ namespace stream {
       // a movie streamed on the same Starlink and loss stayed 13-42% even at 3.3 Mbps), and tripling
       // our own traffic in each window only adds to it.
       bool congested = config::stream.frogtale_adaptive_bitrate && history.base_kbps && history.current_kbps < history.base_kbps;
-      if (history.nacking && !congested && in_handoff_window()) {
+      if (history.nacking && !congested && history.dup_level > 0 && in_handoff_window()) {
         auto now = std::chrono::steady_clock::now();
-        for (auto delay : DUP_DELAYS) {
-          history.duplicates.emplace_back(now + delay, seq);
-        }
-        if (in_core_window()) {
-          history.duplicates.emplace_back(now + std::chrono::milliseconds(120), seq);
+        if (history.dup_level == 1) {
+          history.duplicates.emplace_back(now + std::chrono::milliseconds(60), seq);
+        } else {
+          for (auto delay : DUP_DELAYS) {
+            history.duplicates.emplace_back(now + delay, seq);
+          }
+          if (in_core_window()) {
+            history.duplicates.emplace_back(now + std::chrono::milliseconds(120), seq);
+          }
         }
       }
     }
@@ -569,6 +581,8 @@ namespace stream {
       if (loss > 0.10) {
         target = std::max(history.base_kbps / 8, history.current_kbps * 4 / 10);
         history.clean_seconds = 0;
+        history.queue_ceiling_kbps = history.current_kbps;
+        history.last_cut = now;
       } else if (loss > 0.03 || (loss > 0.01 && ++history.mild_loss_seconds >= 3)) {
         // 1-3% for a single second is a Starlink blip that the FEC boost above already repairs;
         // cutting for it made the picture go soft for 10-15 s at a time (2026-10-15 11:26-11:29).
@@ -576,6 +590,9 @@ namespace stream {
         target = std::max(history.base_kbps / 8, history.current_kbps * 7 / 10);
         history.clean_seconds = 0;
         history.mild_loss_seconds = 0;
+        // 16:05:52 and 16:06:12 on 2026-10-15: loss cuts to 9.4 Mbps were back at 13.4 in 4 s
+        history.queue_ceiling_kbps = history.current_kbps;
+        history.last_cut = now;
       } else if (loss > 0.01) {
         history.clean_seconds = 0;
       } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < config::stream.frogtale_delay_ms)) {
@@ -597,7 +614,7 @@ namespace stream {
         // The ceiling expires 60 s after the last delay step (Starlink congestion passes), and
         // 10% past it the climb is fast again: the link has shown it can take more.
         bool queue_known_empty = history.delay_reports && config::stream.frogtale_delay_ms;
-        if (history.queue_ceiling_kbps && now - history.last_delay_step > std::chrono::seconds(60)) {
+        if (history.queue_ceiling_kbps && now - history.last_cut > std::chrono::seconds(60)) {
           history.queue_ceiling_kbps = 0;
         }
         bool near_ceiling = history.queue_ceiling_kbps && history.current_kbps * 10 >= history.queue_ceiling_kbps * 8 &&
@@ -641,7 +658,28 @@ namespace stream {
       history->delay_reports++;
       if (!off_window) {
         history->delay_over_streak = 0;
+        history->window_open = true;
+        history->window_max_queue_ms = std::max<int>(history->window_max_queue_ms, queue_ms);
         return;
+      }
+      if (history->window_open) {
+        // A handoff window just ended. On a calm link the copies make handoffs nearly invisible
+        // (median pause 64 -> 9 ms, 2026-10-13). On 2026-10-15 15:55-16:11 the link was congested
+        // and nearly every 60-200 ms queue reading fell inside a window, i.e. 3-4x our traffic for
+        // 2.4 s of every 15 was adding to the queue it was meant to beat. Step down a level after a
+        // window that queued 80 ms or more, back up after one under 40 ms.
+        history->window_open = false;
+        int level = history->dup_level;
+        if (history->window_max_queue_ms >= 80 && level > 0) {
+          level--;
+        } else if (history->window_max_queue_ms < 40 && level < 2) {
+          level++;
+        }
+        if (level != history->dup_level) {
+          BOOST_LOG(info) << "FrogtaleTV DUP: window queue "sv << history->window_max_queue_ms << " ms -> copies level "sv << level;
+          history->dup_level = level;
+        }
+        history->window_max_queue_ms = 0;
       }
       history->delay_max_ms = std::max<int>(history->delay_max_ms, queue_ms);
 
@@ -660,6 +698,7 @@ namespace stream {
       history->last_delay_step = now;
       history->clean_seconds = 0;
       history->queue_ceiling_kbps = history->current_kbps;
+      history->last_cut = now;
       int target = queue_ms >= threshold * 4 ? history->current_kbps * 6 / 10 : history->current_kbps * 85 / 100;
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
