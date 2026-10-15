@@ -311,6 +311,7 @@ namespace stream {
       int delay_over_streak = 0;
       int delay_max_ms = 0;  // highest report since the last evaluation, to gate climbing
       std::chrono::steady_clock::time_point last_delay_step;
+      int queue_ceiling_kbps = 0;  // rate the last delay step-down started from; climbs near it go slowly
     };
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
@@ -589,11 +590,25 @@ namespace stream {
         // in 17 s. Clean was gated on the queue staying under half the threshold (15 ms), but
         // Starlink's idle reading is 15-16 ms, so most seconds didn't count. Gate on the threshold
         // itself, and climb +30% every 2 s on a confirmed-clear link (floor to full in ~16 s).
+        // 2026-10-15 15:55-15:58: a delay step 13.4 -> 11.4 Mbps was undone 2-4 s later, twice,
+        // while the link kept queueing 60-150 ms, and it ended in a 350 ms freeze. Like WebRTC's
+        // link-capacity estimate: within 80% of the rate where the queue last built, climb +5%
+        // per 6 clean seconds; far below it, the fast climb above still applies, up to 80% of it.
+        // The ceiling expires 60 s after the last delay step (Starlink congestion passes), and
+        // 10% past it the climb is fast again: the link has shown it can take more.
         bool queue_known_empty = history.delay_reports && config::stream.frogtale_delay_ms;
-        int need = queue_known_empty ? 2 : 8;
+        if (history.queue_ceiling_kbps && now - history.last_delay_step > std::chrono::seconds(60)) {
+          history.queue_ceiling_kbps = 0;
+        }
+        bool near_ceiling = history.queue_ceiling_kbps && history.current_kbps * 10 >= history.queue_ceiling_kbps * 8 &&
+                            history.current_kbps * 10 < history.queue_ceiling_kbps * 11;
+        int need = near_ceiling ? 6 : queue_known_empty ? 2 : 8;
         if (++history.clean_seconds >= need && history.current_kbps < history.base_kbps) {
-          int step = queue_known_empty ? history.current_kbps * 3 / 10 : history.current_kbps / 10;
-          target = std::min(history.base_kbps, std::max(history.current_kbps + step, history.current_kbps + 500));
+          int step = near_ceiling ? history.current_kbps / 20 : queue_known_empty ? history.current_kbps * 3 / 10 : history.current_kbps / 10;
+          target = std::min(history.base_kbps, std::max(history.current_kbps + step, history.current_kbps + 300));
+          if (!near_ceiling && history.queue_ceiling_kbps && history.current_kbps < history.queue_ceiling_kbps) {
+            target = std::min(target, std::max(history.current_kbps + 300, history.queue_ceiling_kbps * 8 / 10));
+          }
           history.clean_seconds = 0;
         }
       } else {
@@ -644,6 +659,7 @@ namespace stream {
       history->delay_over_streak = 0;
       history->last_delay_step = now;
       history->clean_seconds = 0;
+      history->queue_ceiling_kbps = history->current_kbps;
       int target = queue_ms >= threshold * 4 ? history->current_kbps * 6 / 10 : history->current_kbps * 85 / 100;
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
