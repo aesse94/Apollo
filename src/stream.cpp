@@ -604,7 +604,7 @@ namespace stream {
       history->last_delay_step = now;
       history->clean_seconds = 0;
       int target = queue_ms >= threshold * 4 ? history->current_kbps * 6 / 10 : history->current_kbps * 85 / 100;
-      set_bitrate(*history, std::max(history->base_kbps / 4, target), "queue ms", queue_ms);
+      set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
 
     // Sends due duplicates for every client. One thread for the process, started on first use.
