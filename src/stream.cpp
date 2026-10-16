@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -314,6 +315,13 @@ namespace stream {
       int delay_over_streak = 0;
       int delay_max_ms = 0;  // highest report since the last evaluation, to gate climbing
       std::chrono::steady_clock::time_point last_delay_step;
+      // Delivered-rate cuts: bytes we put on the wire (originals, resends, copies) per second, and the
+      // client's received rate from the last FTDL reports outside handoff windows
+      uint64_t wire_bytes = 0;
+      uint64_t last_wire_bytes = 0;
+      int wire_kbps = 0;
+      std::array<int, 4> recv_kbps {};
+      int recv_next = 0;
       bool dipping = false;  // encoding at frogtale_handoff_dip% for a handoff window
       std::chrono::steady_clock::time_point last_dip_check;
       uint64_t dips = 0;
@@ -481,6 +489,7 @@ namespace stream {
       history.seqs[slot] = seq;
       history.valid[slot] = true;
       history.loss_counted[slot] = false;
+      history.wire_bytes += prefixsize + blocksize;
       bool in_window = in_handoff_window();
       history.sent_in_window[slot] = in_window;
       history.sent++;
@@ -515,6 +524,7 @@ namespace stream {
       if (!history.valid[slot] || history.seqs[slot] != seq) {
         return;
       }
+      history.wire_bytes += history.prefixsize + history.blocksize;
       auto *src = &history.packets[slot * (history.prefixsize + history.blocksize)];
       auto send_info = platf::send_info_t {
         history.prefixsize ? src : nullptr,
@@ -547,6 +557,11 @@ namespace stream {
       if (now - history.last_eval < std::chrono::seconds(1)) {
         return;
       }
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - history.last_eval).count();
+      if (elapsed_ms > 0 && elapsed_ms < 5000) {
+        history.wire_kbps = (int) ((history.wire_bytes - history.last_wire_bytes) * 8 / elapsed_ms);
+      }
+      history.last_wire_bytes = history.wire_bytes;
       auto sent = history.sent - history.last_sent;
       auto nacked = history.nacked_off_window - history.last_nacked;
       history.last_eval = now;
@@ -672,6 +687,11 @@ namespace stream {
       uint16_t queue_ms;
       std::memcpy(&queue_ms, payload, sizeof(queue_ms));
       queue_ms = boost::endian::little_to_native(queue_ms);
+      uint16_t recv_kbps = 0;  // newer clients only
+      if (bytes >= 6) {
+        std::memcpy(&recv_kbps, payload + 4, sizeof(recv_kbps));
+        recv_kbps = boost::endian::little_to_native(recv_kbps);
+      }
 
       bool off_window = !in_handoff_window();
       auto now = std::chrono::steady_clock::now();
@@ -683,6 +703,10 @@ namespace stream {
         return;
       }
       history->delay_max_ms = std::max<int>(history->delay_max_ms, queue_ms);
+      if (recv_kbps) {
+        history->recv_kbps[history->recv_next] = recv_kbps;
+        history->recv_next = (history->recv_next + 1) % history->recv_kbps.size();
+      }
 
       int threshold = config::stream.frogtale_delay_ms;
       if (!config::stream.frogtale_adaptive_bitrate || !threshold || !history->bitrate_events || !history->base_kbps) {
@@ -706,6 +730,23 @@ namespace stream {
       history->queue_ceiling_kbps = history->current_kbps;
       history->last_cut = now;
       int target = queue_ms >= threshold * 4 ? history->current_kbps * 6 / 10 : history->current_kbps * 85 / 100;
+      // While a queue stands, what the client receives IS the link's capacity. WebRTC (and so
+      // GeForce Now) steps down to 85% of that delivered rate in one go. Fixed ratios took 20 s and
+      // 4 cuts (13.4 -> 4.8 -> 3.8 -> 2.3 Mbps) at 22:00:30 on 2026-10-15 with the queue at 150-215 ms
+      // throughout. Our wire rate includes FEC, resends and copies, so scale the encoder rate by
+      // received / sent on the wire.
+      std::array<int, 4> r = history->recv_kbps;
+      std::sort(r.begin(), r.end());
+      int recv_median = r[2];  // upper median of the last 4 reports (zeros sort first while filling)
+      if (recv_median > 0 && history->wire_kbps > 0 && recv_median < history->wire_kbps) {
+        int capacity_target = (int) ((int64_t) history->current_kbps * recv_median * 85 / 100 / history->wire_kbps);
+        if (capacity_target < target) {
+          BOOST_LOG(info) << "FrogtaleTV ABR: delivered "sv << recv_median << " of "sv << history->wire_kbps << " kbps on the wire"sv;
+          target = capacity_target;
+          // Climb back slowly around what the link delivered, not the rate that overran it
+          history->queue_ceiling_kbps = capacity_target * 100 / 85;
+        }
+      }
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
 
