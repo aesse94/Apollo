@@ -188,7 +188,7 @@ namespace config {
     // FrogtaleTV patch: reference frames kept for RFI recovery (0 = stock 5)
     int frogtale_ref_frames;
 
-    // FrogtaleTV patch: A/B test of handoff copies: 1 = no copies in odd UTC minutes
+    // FrogtaleTV patch: handoff copies: 0 = on, 1 = A/B (none in odd UTC minutes), 2 = off
     int frogtale_dup_ab;
   };
 

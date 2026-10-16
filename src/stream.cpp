@@ -491,7 +491,11 @@ namespace stream {
       // full copies, 0.10 with one, 0.23 with none. Copies stay on.
       // A/B (frogtale_dup_ab): weather changes faster than a whole-session comparison, so alternate
       // copies off/on by minute and compare handoff pauses on the client per minute parity.
-      bool ab_off = config::stream.frogtale_dup_ab && (epoch_now_ms() / 60000) % 2 == 1;
+      // Result, rain on 2026-10-15 21:32-21:41 (35 handoffs): copies ON median handoff pause 130 ms,
+      // 13 hold timeouts, median worst queue 95 ms; OFF 84 ms, 0 timeouts, 20 ms. At 3-4x our rate
+      // the copies were building the very queue they were meant to beat. 2 = off.
+      bool ab_off = config::stream.frogtale_dup_ab == 2 ||
+                    (config::stream.frogtale_dup_ab == 1 && (epoch_now_ms() / 60000) % 2 == 1);
       if (history.nacking && !congested && in_window && !ab_off) {
         auto now = std::chrono::steady_clock::now();
         for (auto delay : DUP_DELAYS) {
