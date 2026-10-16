@@ -324,6 +324,7 @@ namespace stream {
       int recv_next = 0;
       bool dipping = false;  // encoding at dip_pct% for a handoff window
       int dip_pct = 100;
+      bool starlink_seen = false;  // last reported starlink_detected(), for the log
       bool half_rate = false;  // frogtale_half_rate_pct: encoding every other frame
       int full_rate_seconds = 0;
       std::chrono::steady_clock::time_point last_dip_check;
@@ -357,6 +358,17 @@ namespace stream {
     std::mutex phase_mutex;
     std::array<double, BUCKETS> phase_histogram {};
     int64_t learned_phase_ms = -1;  // phase of NACK arrivals within the cycle, or -1 = not learned
+    std::chrono::steady_clock::time_point last_burst_at;  // last burst NACK fed to the learner
+
+    // Moonlight Starlink: everything tuned to Starlink's 15 s reconfiguration (handoff windows, copies,
+    // the handoff dip, ignoring handoff loss and delay) applies only while the client's link actually
+    // shows that rhythm: a confidently learned phase, fed by a burst within the last 2 minutes. On
+    // cable, fibre or plain Wi-Fi the learner never locks, so none of it runs; and a phase learned in
+    // an earlier Starlink session expires instead of dipping a later client every 15 s for nothing.
+    bool starlink_detected() {
+      std::lock_guard lg {phase_mutex};
+      return learned_phase_ms >= 0 && std::chrono::steady_clock::now() - last_burst_at < std::chrono::minutes(2);
+    }
 
     int64_t cycle_phase(int64_t epoch_ms) {
       return ((epoch_ms - 12000) % CYCLE_MS + CYCLE_MS) % CYCLE_MS;  // 0 = scheduled handoff
@@ -378,6 +390,7 @@ namespace stream {
         bucket *= decay;
       }
       phase_histogram[cycle_phase(epoch_now_ms()) / BUCKET_MS] += 1.0;
+      last_burst_at = now;
 
       // Sum each bucket with its neighbours, since a stall can straddle a bucket edge
       double total = 0, best = 0;
@@ -414,6 +427,9 @@ namespace stream {
     }
 
     bool in_handoff_window() {
+      if (!starlink_detected()) {
+        return false;
+      }
       auto phase = cycle_phase(epoch_now_ms());
       int64_t center;
       {
@@ -614,6 +630,10 @@ namespace stream {
       history.last_eval = now;
       history.last_sent = history.sent;
       history.last_nacked = history.nacked_off_window;
+      if (bool sd = starlink_detected(); sd != history.starlink_seen) {
+        history.starlink_seen = sd;
+        BOOST_LOG(info) << "Moonlight Starlink: "sv << (sd ? "Starlink handoff rhythm detected, handoff handling on"sv : "no Starlink handoff rhythm, handoff handling off"sv);
+      }
       if (sent < 30) {
         return;  // not streaming, or nothing changing on screen (was 100: at the 1.7 Mbps floor and
                  // half frame rate the stream sends only ~100 packets a second)
