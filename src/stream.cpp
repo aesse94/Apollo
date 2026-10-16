@@ -322,7 +322,8 @@ namespace stream {
       int wire_kbps = 0;
       std::array<int, 4> recv_kbps {};
       int recv_next = 0;
-      bool dipping = false;  // encoding at frogtale_handoff_dip% for a handoff window
+      bool dipping = false;  // encoding at dip_pct% for a handoff window
+      int dip_pct = 100;
       std::chrono::steady_clock::time_point last_dip_check;
       uint64_t dips = 0;
       int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
@@ -541,7 +542,7 @@ namespace stream {
 
     void set_bitrate(history_t &history, int target, const char *reason, double value) {
       if (std::abs(target - history.current_kbps) * 20 >= history.current_kbps) {
-        history.bitrate_events->raise(history.dipping ? target * config::stream.frogtale_handoff_dip / 100 : target);
+        history.bitrate_events->raise(history.dipping ? target * history.dip_pct / 100 : target);
         BOOST_LOG(info) << "FrogtaleTV ABR: "sv << reason << ' ' << value << " -> "sv << target << " kbps (base "sv << history.base_kbps << ")"sv;
         history.current_kbps = target;
       }
@@ -773,13 +774,23 @@ namespace stream {
       }
       history.last_dip_check = now;
       int pct = config::stream.frogtale_handoff_dip;
+      if (config::stream.frogtale_dip_ab) {
+        bool odd = (epoch_now_ms() / 60000) % 2 == 1;
+        if (config::stream.frogtale_dip_ab_pct) {
+          if (odd) {
+            pct = config::stream.frogtale_dip_ab_pct;
+          }
+        } else if (!odd) {
+          pct = 0;
+        }
+      }
       bool want = pct > 0 && pct < 100 && history.nacking && history.bitrate_events && history.current_kbps > 0 &&
-                  in_handoff_window() &&
-                  !(config::stream.frogtale_dip_ab && (epoch_now_ms() / 60000) % 2 == 0);
+                  in_handoff_window();
       if (want == history.dipping) {
         return;
       }
       history.dipping = want;
+      history.dip_pct = want ? pct : 100;
       history.bitrate_events->raise(want ? history.current_kbps * pct / 100 : history.current_kbps);
       if (want && history.dips++ == 0) {
         BOOST_LOG(info) << "FrogtaleTV DIP: first handoff dip to "sv << pct << "% ("sv << history.current_kbps * pct / 100 << " kbps)"sv;

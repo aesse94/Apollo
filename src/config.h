@@ -195,6 +195,8 @@ namespace config {
     // window (0 = off), and with frogtale_dip_ab = 1 only in odd UTC minutes (A/B)
     int frogtale_handoff_dip;
     int frogtale_dip_ab;
+    // with frogtale_dip_ab = 1: dip to this percentage in odd minutes instead of not dipping (0 = no dip)
+    int frogtale_dip_ab_pct;
   };
 
   struct nvhttp_t {
