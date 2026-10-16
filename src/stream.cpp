@@ -359,15 +359,20 @@ namespace stream {
     std::array<double, BUCKETS> phase_histogram {};
     int64_t learned_phase_ms = -1;  // phase of NACK arrivals within the cycle, or -1 = not learned
     std::chrono::steady_clock::time_point last_burst_at;  // last burst NACK fed to the learner
+    std::chrono::steady_clock::time_point last_locked_at;  // last time the learner held a confident phase
 
     // Moonlight Starlink: everything tuned to Starlink's 15 s reconfiguration (handoff windows, copies,
     // the handoff dip, ignoring handoff loss and delay) applies only while the client's link actually
-    // shows that rhythm: a confidently learned phase, fed by a burst within the last 2 minutes. On
+    // shows that rhythm: a confidently learned phase in the last 5 minutes and a burst in the last 2. On
     // cable, fibre or plain Wi-Fi the learner never locks, so none of it runs; and a phase learned in
     // an earlier Starlink session expires instead of dipping a later client every 15 s for nothing.
+    // Hysteresis: in a rough patch random loss can dilute the handoff peak below 50% for minutes
+    // (2026-10-16 15:08-15:11 on the in-laws' Starlink), which is exactly when the handling matters;
+    // so once locked it stays on while bursts keep coming, and lets go 5 minutes after the last lock.
     bool starlink_detected() {
       std::lock_guard lg {phase_mutex};
-      return learned_phase_ms >= 0 && std::chrono::steady_clock::now() - last_burst_at < std::chrono::minutes(2);
+      auto now = std::chrono::steady_clock::now();
+      return now - last_locked_at < std::chrono::minutes(5) && now - last_burst_at < std::chrono::minutes(2);
     }
 
     int64_t cycle_phase(int64_t epoch_ms) {
@@ -424,6 +429,9 @@ namespace stream {
         }
       }
       learned_phase_ms = learned;
+      if (learned >= 0) {
+        last_locked_at = now;
+      }
     }
 
     bool in_handoff_window() {
