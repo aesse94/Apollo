@@ -658,7 +658,13 @@ namespace stream {
                             history.current_kbps * 10 < history.queue_ceiling_kbps * 11;
         int need = near_ceiling ? 6 : queue_known_empty ? 2 : 8;
         if (++history.clean_seconds >= need && history.current_kbps < history.base_kbps) {
-          int step = near_ceiling ? history.current_kbps / 20 : queue_known_empty ? history.current_kbps * 3 / 10 : history.current_kbps / 10;
+          // Within a minute of a cut, climb like WebRTC's multiplicative increase (~8%/s at most):
+          // +10% per 2 s, not +30%. A rainy Starlink link that just collapsed recovers over minutes,
+          // and the fast climb walked straight back into it (22:28:48 full rate, stall 22:30:57).
+          bool recent_cut = now - history.last_cut < std::chrono::seconds(60);
+          int step = near_ceiling ? history.current_kbps / 20 :
+                     queue_known_empty ? history.current_kbps * (recent_cut ? 1 : 3) / 10 :
+                     history.current_kbps / 10;
           target = std::min(history.base_kbps, std::max(history.current_kbps + step, history.current_kbps + 300));
           if (!near_ceiling && history.queue_ceiling_kbps && history.current_kbps < history.queue_ceiling_kbps) {
             target = std::min(target, std::max(history.current_kbps + 300, history.queue_ceiling_kbps * 8 / 10));
@@ -743,8 +749,10 @@ namespace stream {
         if (capacity_target < target) {
           BOOST_LOG(info) << "FrogtaleTV ABR: delivered "sv << recv_median << " of "sv << history->wire_kbps << " kbps on the wire"sv;
           target = capacity_target;
-          // Climb back slowly around what the link delivered, not the rate that overran it
-          history->queue_ceiling_kbps = capacity_target * 100 / 85;
+          // Climb back slowly around what the link delivered, not the rate that overran it. Floored
+          // like the cut: at 22:28:23 on 2026-10-15 the estimate (860) sat below the 1673 floor, so the
+          // stream was never "near" it and climbed 1.7 -> 13.4 Mbps in 16 s, into the next stall.
+          history->queue_ceiling_kbps = std::max(history->base_kbps / 8, capacity_target * 100 / 85);
         }
       }
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
