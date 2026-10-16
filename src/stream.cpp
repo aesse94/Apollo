@@ -793,7 +793,11 @@ namespace stream {
       std::array<int, 4> r = history->recv_kbps;
       std::sort(r.begin(), r.end());
       int recv_median = r[2];  // upper median of the last 4 reports (zeros sort first while filling)
-      if (recv_median > 0 && history->wire_kbps > 0 && recv_median < history->wire_kbps) {
+      // Only when we are actually filling the link: in a quiet scene the encoder sends far below its
+      // target, and "delivered" is just what we sent (11:39:24 on 2026-10-16: 661 of 737 kbps on the
+      // wire cut the target 9.7 -> 7.4 Mbps). The wire normally runs above the target (FEC).
+      if (recv_median > 0 && history->wire_kbps > 0 && recv_median < history->wire_kbps &&
+          history->wire_kbps * 2 >= history->current_kbps) {
         int capacity_target = (int) ((int64_t) history->current_kbps * recv_median * 85 / 100 / history->wire_kbps);
         if (capacity_target < target) {
           BOOST_LOG(info) << "FrogtaleTV ABR: delivered "sv << recv_median << " of "sv << history->wire_kbps << " kbps on the wire"sv;
