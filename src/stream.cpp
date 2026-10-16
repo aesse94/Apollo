@@ -489,7 +489,10 @@ namespace stream {
       // 2026-10-15 16:13-19:10 tried fewer copies after a window that queued (theory: our 3-4x
       // traffic was adding to the queue). It measured the other way: timeouts per handoff 0.04 with
       // full copies, 0.10 with one, 0.23 with none. Copies stay on.
-      if (history.nacking && !congested && in_window) {
+      // A/B (frogtale_dup_ab): weather changes faster than a whole-session comparison, so alternate
+      // copies off/on by minute and compare handoff pauses on the client per minute parity.
+      bool ab_off = config::stream.frogtale_dup_ab && (epoch_now_ms() / 60000) % 2 == 1;
+      if (history.nacking && !congested && in_window && !ab_off) {
         auto now = std::chrono::steady_clock::now();
         for (auto delay : DUP_DELAYS) {
           history.duplicates.emplace_back(now + delay, seq);

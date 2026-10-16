@@ -187,6 +187,9 @@ namespace config {
 
     // FrogtaleTV patch: reference frames kept for RFI recovery (0 = stock 5)
     int frogtale_ref_frames;
+
+    // FrogtaleTV patch: A/B test of handoff copies: 1 = no copies in odd UTC minutes
+    int frogtale_dup_ab;
   };
 
   struct nvhttp_t {
