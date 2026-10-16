@@ -314,6 +314,9 @@ namespace stream {
       int delay_over_streak = 0;
       int delay_max_ms = 0;  // highest report since the last evaluation, to gate climbing
       std::chrono::steady_clock::time_point last_delay_step;
+      bool dipping = false;  // encoding at frogtale_handoff_dip% for a handoff window
+      std::chrono::steady_clock::time_point last_dip_check;
+      uint64_t dips = 0;
       int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
       std::chrono::steady_clock::time_point last_cut;
 
@@ -528,7 +531,7 @@ namespace stream {
 
     void set_bitrate(history_t &history, int target, const char *reason, double value) {
       if (std::abs(target - history.current_kbps) * 20 >= history.current_kbps) {
-        history.bitrate_events->raise(target);
+        history.bitrate_events->raise(history.dipping ? target * config::stream.frogtale_handoff_dip / 100 : target);
         BOOST_LOG(info) << "FrogtaleTV ABR: "sv << reason << ' ' << value << " -> "sv << target << " kbps (base "sv << history.base_kbps << ")"sv;
         history.current_kbps = target;
       }
@@ -706,6 +709,31 @@ namespace stream {
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
 
+    // A Starlink handoff stalls the downlink, and whatever we send meanwhile queues up and has to
+    // drain before the picture moves again, so the pause is the stall plus that drain. On a rainy
+    // link the drain is the bigger part: an A/B on 2026-10-15 showed our handoff copies (3-4x the
+    // traffic) raising the median pause 84 -> 130 ms and the worst queue 20 -> 95 ms. The handoff
+    // schedule is predictable, so encode leaner just for the window (frogtale_handoff_dip % of the
+    // current rate, ~2.4 s of every 15) and keep full quality the rest of the time.
+    void apply_handoff_dip(history_t &history, std::chrono::steady_clock::time_point now) {
+      if (now - history.last_dip_check < std::chrono::milliseconds(20)) {
+        return;
+      }
+      history.last_dip_check = now;
+      int pct = config::stream.frogtale_handoff_dip;
+      bool want = pct > 0 && pct < 100 && history.nacking && history.bitrate_events && history.current_kbps > 0 &&
+                  in_handoff_window() &&
+                  !(config::stream.frogtale_dip_ab && (epoch_now_ms() / 60000) % 2 == 0);
+      if (want == history.dipping) {
+        return;
+      }
+      history.dipping = want;
+      history.bitrate_events->raise(want ? history.current_kbps * pct / 100 : history.current_kbps);
+      if (want && history.dips++ == 0) {
+        BOOST_LOG(info) << "FrogtaleTV DIP: first handoff dip to "sv << pct << "% ("sv << history.current_kbps * pct / 100 << " kbps)"sv;
+      }
+    }
+
     // Sends due duplicates for every client. One thread for the process, started on first use.
     void duplicate_thread() {
       platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -722,6 +750,7 @@ namespace stream {
         for (auto &history : all) {
           std::lock_guard lg {history->mutex};
           adapt_bitrate(*history, now);
+          apply_handoff_dip(*history, now);
 
           auto &queue = history->duplicates;
           for (auto it = queue.begin(); it != queue.end();) {

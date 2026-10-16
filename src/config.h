@@ -190,6 +190,11 @@ namespace config {
 
     // FrogtaleTV patch: handoff copies: 0 = on, 1 = A/B (none in odd UTC minutes), 2 = off
     int frogtale_dup_ab;
+
+    // FrogtaleTV patch: encode at this percentage of the current bitrate inside each Starlink handoff
+    // window (0 = off), and with frogtale_dip_ab = 1 only in odd UTC minutes (A/B)
+    int frogtale_handoff_dip;
+    int frogtale_dip_ab;
   };
 
   struct nvhttp_t {

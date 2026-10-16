@@ -542,6 +542,8 @@ namespace config {
     30,  // frogtale_delay_ms
     16,  // frogtale_ref_frames
     0,  // frogtale_dup_ab
+    0,  // frogtale_handoff_dip
+    0,  // frogtale_dip_ab
   };
 
   nvhttp_t nvhttp {
@@ -1253,6 +1255,8 @@ namespace config {
     int_between_f(vars, "frogtale_adaptive_bitrate", stream.frogtale_adaptive_bitrate, {0, 1});
     int_between_f(vars, "frogtale_delay_ms", stream.frogtale_delay_ms, {0, 1000});
     int_between_f(vars, "frogtale_dup_ab", stream.frogtale_dup_ab, {0, 2});
+    int_between_f(vars, "frogtale_handoff_dip", stream.frogtale_handoff_dip, {0, 100});
+    int_between_f(vars, "frogtale_dip_ab", stream.frogtale_dip_ab, {0, 1});
     int_between_f(vars, "frogtale_ref_frames", stream.frogtale_ref_frames, {0, 16});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
