@@ -324,6 +324,8 @@ namespace stream {
       int recv_next = 0;
       bool dipping = false;  // encoding at dip_pct% for a handoff window
       int dip_pct = 100;
+      bool half_rate = false;  // frogtale_half_rate_pct: encoding every other frame
+      int full_rate_seconds = 0;
       std::chrono::steady_clock::time_point last_dip_check;
       uint64_t dips = 0;
       int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
@@ -540,11 +542,53 @@ namespace stream {
       platf::send(send_info);
     }
 
+    // What the encoder is told: the ABR rate, scaled for a handoff dip, and at half frame rate
+    // 1.3x per second (so each encoded frame gets 2.6x the bits and the wire carries 0.65x).
+    void raise_encoder(history_t &history) {
+      int kbps = history.current_kbps;
+      if (history.dipping) {
+        kbps = kbps * history.dip_pct / 100;
+      }
+      if (history.half_rate) {
+        kbps = kbps * 13 / 10;
+      }
+      history.bitrate_events->raise(kbps | (history.half_rate ? mail::frogtale_half_rate_flag : 0));
+    }
+
     void set_bitrate(history_t &history, int target, const char *reason, double value) {
       if (std::abs(target - history.current_kbps) * 20 >= history.current_kbps) {
-        history.bitrate_events->raise(history.dipping ? target * history.dip_pct / 100 : target);
         BOOST_LOG(info) << "FrogtaleTV ABR: "sv << reason << ' ' << value << " -> "sv << target << " kbps (base "sv << history.base_kbps << ")"sv;
         history.current_kbps = target;
+        raise_encoder(history);
+      }
+    }
+
+    // GeForce Now keeps a low-bitrate stream watchable by shrinking it (2026-10-16 11:12: 1280x800
+    // -> 992x620 while the Deco Wi-Fi blacked out, at ~2 Mbps). Moonlight can't change resolution
+    // mid-stream, but frame rate is free: at or below frogtale_half_rate_pct of base, encode every
+    // other frame (45 fps). Each frame gets 2.6x the bits (sharper), the wire carries ~0.65x, and a
+    // stall costs half as many frames. Back to full rate after 10 s above the threshold + 20 points.
+    void update_half_rate(history_t &history) {
+      int pct = config::stream.frogtale_half_rate_pct;
+      if (!pct || !history.base_kbps || !history.bitrate_events) {
+        return;
+      }
+      bool ab_off = config::stream.frogtale_half_rate_ab && (epoch_now_ms() / 60000) % 2 == 0;
+      bool want = history.half_rate;
+      if (ab_off) {
+        want = false;
+      } else if (!history.half_rate) {
+        want = (int64_t) history.current_kbps * 100 <= (int64_t) history.base_kbps * pct;
+      } else if ((int64_t) history.current_kbps * 100 >= (int64_t) history.base_kbps * (pct + 20)) {
+        want = ++history.full_rate_seconds < 10;
+      } else {
+        history.full_rate_seconds = 0;
+      }
+      if (want != history.half_rate) {
+        history.half_rate = want;
+        history.full_rate_seconds = 0;
+        BOOST_LOG(info) << "FrogtaleTV FPS: "sv << (want ? "half" : "full") << " rate at "sv << history.current_kbps << " kbps"sv;
+        raise_encoder(history);
       }
     }
 
@@ -568,8 +612,9 @@ namespace stream {
       history.last_eval = now;
       history.last_sent = history.sent;
       history.last_nacked = history.nacked_off_window;
-      if (sent < 100) {
-        return;  // not streaming, or nothing changing on screen
+      if (sent < 30) {
+        return;  // not streaming, or nothing changing on screen (was 100: at the 1.7 Mbps floor and
+                 // half frame rate the stream sends only ~100 packets a second)
       }
 
       double loss = (double) nacked / (double) sent;
@@ -677,6 +722,7 @@ namespace stream {
       }
 
       set_bitrate(history, target, "loss %", (int) (loss * 1000) / 10.0);
+      update_half_rate(history);
     }
 
     // GeForce Now (WebRTC) backs off as soon as one-way delay climbs, i.e. a queue is building
@@ -791,7 +837,7 @@ namespace stream {
       }
       history.dipping = want;
       history.dip_pct = want ? pct : 100;
-      history.bitrate_events->raise(want ? history.current_kbps * pct / 100 : history.current_kbps);
+      raise_encoder(history);
       if (want && history.dips++ == 0) {
         BOOST_LOG(info) << "FrogtaleTV DIP: first handoff dip to "sv << pct << "% ("sv << history.current_kbps * pct / 100 << " kbps)"sv;
       }

@@ -1973,6 +1973,8 @@ namespace video {
     }
 
     std::chrono::steady_clock::time_point encode_frame_timestamp;
+    bool half_rate = false;  // FrogtaleTV: encode every other captured frame
+    bool skip_toggle = false;
 
     while (true) {
       // Break out of the encoding loop if any of the following are true:
@@ -1990,7 +1992,8 @@ namespace video {
 
       while (bitrate_events->peek()) {
         if (auto kbps = bitrate_events->pop(0ms)) {
-          session->set_bitrate(*kbps);
+          half_rate = (*kbps & mail::frogtale_half_rate_flag) != 0;
+          session->set_bitrate(*kbps & ~mail::frogtale_half_rate_flag);
         }
       }
 
@@ -2014,6 +2017,9 @@ namespace video {
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          if (half_rate && !requested_idr_frame && (skip_toggle = !skip_toggle)) {
+            continue;
+          }
           frame_timestamp = img->frame_timestamp;
           auto time_diff = *frame_timestamp - encode_frame_timestamp;
 

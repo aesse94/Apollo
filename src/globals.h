@@ -54,6 +54,8 @@ namespace mail {
   MAIL(idr);
   MAIL(invalidate_ref_frames);
   MAIL(frogtale_bitrate);
+  // FrogtaleTV patch: set in a frogtale_bitrate value to encode every other captured frame
+  constexpr int frogtale_half_rate_flag = 1 << 30;
   MAIL(gamepad_feedback);
   MAIL(hdr);
 #undef MAIL
