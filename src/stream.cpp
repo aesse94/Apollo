@@ -715,6 +715,9 @@ namespace stream {
     // traffic) raising the median pause 84 -> 130 ms and the worst queue 20 -> 95 ms. The handoff
     // schedule is predictable, so encode leaner just for the window (frogtale_handoff_dip % of the
     // current rate, ~2.4 s of every 15) and keep full quality the rest of the time.
+    // A/B in rain, 2026-10-15 21:50-21:57 (copies off, 30 handoffs): dip 60% median handoff pause
+    // 70 ms, 1 pause >= 150 ms, 0 hold timeouts, worst queue 18 ms; no dip 136 ms, 7, 4, 61 ms.
+    // The softer frames during the window were not noticeable on the Deck.
     void apply_handoff_dip(history_t &history, std::chrono::steady_clock::time_point now) {
       if (now - history.last_dip_check < std::chrono::milliseconds(20)) {
         return;
