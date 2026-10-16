@@ -200,7 +200,7 @@ namespace config {
 
     // FrogtaleTV patch: encode every other frame while the adaptive bitrate is at or below this
     // percentage of the base (0 = never); back to full rate above it + 20 points for 10 s.
-    // frogtale_half_rate_ab = 1 allows it only in odd UTC minutes (A/B)
+    // frogtale_half_rate_ab = 1 allows it only in odd 2-minute UTC blocks (A/B)
     int frogtale_half_rate_pct;
     int frogtale_half_rate_ab;
   };

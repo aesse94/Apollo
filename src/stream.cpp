@@ -573,7 +573,9 @@ namespace stream {
       if (!pct || !history.base_kbps || !history.bitrate_events) {
         return;
       }
-      bool ab_off = config::stream.frogtale_half_rate_ab && (epoch_now_ms() / 60000) % 2 == 0;
+      // A/B in 2-minute blocks (on when the block index is odd), so it stays independent of the
+      // client's handoff-cushion A/B, which alternates every minute
+      bool ab_off = config::stream.frogtale_half_rate_ab && (epoch_now_ms() / 120000) % 2 == 0;
       bool want = history.half_rate;
       if (ab_off) {
         want = false;
