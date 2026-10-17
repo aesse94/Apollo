@@ -331,6 +331,11 @@ namespace stream {
       uint64_t dips = 0;
       int queue_ceiling_kbps = 0;  // rate the last step-down started from; climbs near it go slowly
       std::chrono::steady_clock::time_point last_cut;
+      // A delay cut that the link answers by clearing within a second is a blip, not a capacity
+      // drop: climb back fast after it (see adapt_bitrate). Only the first cut in a minute qualifies.
+      bool blip_allowed = false;
+      bool blip = false;
+      int clear_after_cut = 0;
 
     };
 
@@ -693,6 +698,7 @@ namespace stream {
         if (can_cut) {
           target = std::max(std::min(loss_floor, history.current_kbps), history.current_kbps * 6 / 10);
           history.last_cut = now;
+          history.blip_allowed = history.blip = false;
         }
         history.clean_seconds = 0;
       } else if (history.lossy_seconds >= 3 || (loss > 0.01 && ++history.mild_loss_seconds >= 3)) {
@@ -704,6 +710,7 @@ namespace stream {
           // Sustained loss is a capacity problem: climb back slowly near here (see below)
           history.queue_ceiling_kbps = history.current_kbps;
           history.last_cut = now;
+          history.blip_allowed = history.blip = false;
         }
         history.clean_seconds = 0;
       } else if (loss > 0.01) {
@@ -730,6 +737,9 @@ namespace stream {
         if (history.queue_ceiling_kbps && now - history.last_cut > std::chrono::seconds(60)) {
           history.queue_ceiling_kbps = 0;
         }
+        if (history.blip) {
+          history.queue_ceiling_kbps = 0;  // a blip says nothing about the link's capacity
+        }
         bool near_ceiling = history.queue_ceiling_kbps && history.current_kbps * 10 >= history.queue_ceiling_kbps * 8 &&
                             history.current_kbps * 10 < history.queue_ceiling_kbps * 11;
         int need = near_ceiling ? 6 : queue_known_empty ? 2 : 8;
@@ -737,7 +747,10 @@ namespace stream {
           // Within a minute of a cut, climb like WebRTC's multiplicative increase (~8%/s at most):
           // +10% per 2 s, not +30%. A rainy Starlink link that just collapsed recovers over minutes,
           // and the fast climb walked straight back into it (22:28:48 full rate, stall 22:30:57).
-          bool recent_cut = now - history.last_cut < std::chrono::seconds(60);
+          // ...unless the cut was a blip: at 23:01:09 on 2026-10-16 a ~1 s Starlink stall (queue 207 ms,
+          // Wi-Fi spotless) cut 13.4 -> 6.8 Mbps and the cautious climb kept the picture soft for ~30 s;
+          // the queue was back to normal within a second. GeForce Now snaps back within seconds.
+          bool recent_cut = now - history.last_cut < std::chrono::seconds(60) && !history.blip;
           int step = near_ceiling ? history.current_kbps / 20 :
                      queue_known_empty ? history.current_kbps * (recent_cut ? 1 : 3) / 10 :
                      history.current_kbps / 10;
@@ -795,6 +808,13 @@ namespace stream {
       if (!config::stream.frogtale_adaptive_bitrate || !threshold || !history->bitrate_events || !history->base_kbps) {
         return;
       }
+      if (history->blip_allowed && !history->blip && now - history->last_cut < std::chrono::seconds(3)) {
+        history->clear_after_cut = queue_ms < threshold ? history->clear_after_cut + 1 : 0;
+        if (history->clear_after_cut >= 4) {
+          history->blip = true;
+          BOOST_LOG(info) << "FrogtaleTV ABR: blip, the queue cleared within a second of the cut; fast climb"sv;
+        }
+      }
       if (queue_ms < threshold) {
         history->delay_over_streak = 0;
         return;
@@ -811,6 +831,9 @@ namespace stream {
       history->last_delay_step = now;
       history->clean_seconds = 0;
       history->queue_ceiling_kbps = history->current_kbps;
+      history->blip_allowed = now - history->last_cut >= std::chrono::seconds(60);
+      history->blip = false;
+      history->clear_after_cut = 0;
       history->last_cut = now;
       int target = queue_ms >= threshold * 4 ? history->current_kbps * 6 / 10 : history->current_kbps * 85 / 100;
       // While a queue stands, what the client receives IS the link's capacity. WebRTC (and so
