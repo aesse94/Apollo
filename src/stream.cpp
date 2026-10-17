@@ -439,11 +439,21 @@ namespace stream {
       }
     }
 
-    bool in_handoff_window() {
-      if (!starlink_detected()) {
+    // require_detected: only while the Starlink rhythm is detected (the handoff dip and copies, which
+    // cost picture quality). Without it the window always applies, on the fixed :12/:27/:42/:57
+    // schedule until a phase is learned: ignoring loss and delay readings for ~2.4 s of every 15 is
+    // harmless on other links, and on Starlink it must work from the first second. 2026-10-17
+    // 09:51: with everything gated on detection (which took 2 min), handoff delay spikes read as
+    // congestion and cut 13.4 -> 5.0 Mbps in 23 s, and four handoffs froze 71-82 ms.
+    bool in_handoff_window(bool require_detected = false) {
+      bool detected = starlink_detected();
+      if (require_detected && !detected) {
         return false;
       }
       auto phase = cycle_phase(epoch_now_ms());
+      if (!detected) {
+        return phase >= CYCLE_MS - SCHEDULE_WINDOW_MS || phase <= SCHEDULE_WINDOW_MS;
+      }
       int64_t center;
       {
         std::lock_guard lg {phase_mutex};
@@ -524,6 +534,7 @@ namespace stream {
       history.wire_bytes += prefixsize + blocksize;
       bool in_window = in_handoff_window();
       history.sent_in_window[slot] = in_window;
+      bool dup_window = in_window && in_handoff_window(true);
       history.sent++;
 
       // No copies while adaptive bitrate has stepped down: then the link is congested (on 2026-10-13
@@ -540,7 +551,7 @@ namespace stream {
       // the copies were building the very queue they were meant to beat. 2 = off.
       bool ab_off = config::stream.frogtale_dup_ab == 2 ||
                     (config::stream.frogtale_dup_ab == 1 && (epoch_now_ms() / 60000) % 2 == 1);
-      if (history.nacking && !congested && in_window && !ab_off) {
+      if (history.nacking && !congested && dup_window && !ab_off) {
         auto now = std::chrono::steady_clock::now();
         for (auto delay : DUP_DELAYS) {
           history.duplicates.emplace_back(now + delay, seq);
@@ -791,6 +802,11 @@ namespace stream {
 
       bool off_window = !in_handoff_window();
       auto now = std::chrono::steady_clock::now();
+      // Handoff stalls also show as queue spikes on the schedule, often before any NACK burst;
+      // feeding those to the phase learner detects Starlink within a few handoffs.
+      if (!off_window && config::stream.frogtale_delay_ms && queue_ms >= 2 * config::stream.frogtale_delay_ms) {
+        learn_handoff_phase();
+      }
 
       std::lock_guard lg {history->mutex};
       history->delay_reports++;
@@ -888,7 +904,7 @@ namespace stream {
         }
       }
       bool want = pct > 0 && pct < 100 && history.nacking && history.bitrate_events && history.current_kbps > 0 &&
-                  in_handoff_window();
+                  in_handoff_window(true);
       if (want == history.dipping) {
         return;
       }
