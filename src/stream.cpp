@@ -835,6 +835,14 @@ namespace stream {
         history->delay_over_streak = 0;
         return;
       }
+      // A queue only builds on a loaded link. 2026-10-20 18:36 (Apple TV at home, 4K): a static
+      // Playnite menu sent ~0.36 Mbps, the client's few samples (3 frames per report) read a steady
+      // 82-90 ms "queue", and five delay steps cut 39 -> 17 Mbps for nothing. Ignore delay readings
+      // while the client receives under a quarter of the target rate.
+      if (recv_kbps && (int64_t) recv_kbps * 4 < history->current_kbps) {
+        history->delay_over_streak = 0;
+        return;
+      }
       if (++history->delay_over_streak < 2 || now - history->last_delay_step < std::chrono::seconds(1)) {
         return;
       }
