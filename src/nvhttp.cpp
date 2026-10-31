@@ -1416,6 +1416,21 @@ namespace nvhttp {
         return;
       }
     }
+#ifdef _WIN32
+    else if (no_active_sessions && launch_session->width && launch_session->height && launch_session->fps) {
+      // Moonlight Starlink: a resume reuses the virtual display made at launch, so a client that
+      // launched at 1080p and resumed asking for 4K kept streaming 1080p (Apple TV, 2026-10-31).
+      // Re-mode it to what this resume asked for, as launch does after creating it.
+      int target_fps = launch_session->fps;
+      if (config::video.double_refreshrate) {
+        target_fps *= 2;
+      }
+      auto display_name = platf::from_utf8(proc::proc.display_name);
+      auto rc = VDISPLAY::changeDisplaySettings(display_name.c_str(), launch_session->width, launch_session->height, target_fps);
+      BOOST_LOG(info) << "Moonlight Starlink: resume re-moded virtual display "sv << proc::proc.display_name << " to ["sv
+                      << launch_session->width << 'x' << launch_session->height << 'x' << target_fps / 1000 << "] rc="sv << rc;
+    }
+#endif
 
     auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
