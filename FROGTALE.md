@@ -36,3 +36,13 @@ ninja -C build sunshine
 install; keep the original so you can switch back.
 
 Apollo is GPL-3.0, and so is everything here.
+
+## 2026-11-08: the delay cut threshold adapts to the link
+`frogtale_delay_ms` (30) is now a floor, not the threshold. Each client's queue reports (`FTDL`)
+feed a baseline (average of reports under the threshold) and a jitter estimate; the cut threshold is
+baseline + 3 x jitter, clamped to [`frogtale_delay_ms`, 4 x `frogtale_delay_ms`]. Starlink (idle
+15-16 ms, jitter ~5) keeps 30 ms; a home Wi-Fi link that idles at 50 ms with 10 ms of jitter gets
+~80 ms instead of a bitrate cut on every retry burst. Logged once a minute as
+`FrogtaleTV ABR: queue baseline B ms, jitter J ms, cut threshold T ms`, and each cut says
+`queue Q ms over the T ms threshold`. The 60% FEC boost now needs two consecutive seconds over 4%
+loss (40% still answers one).

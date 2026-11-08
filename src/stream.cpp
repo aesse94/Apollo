@@ -337,6 +337,14 @@ namespace stream {
       bool blip = false;
       int clear_after_cut = 0;
 
+      // Adaptive delay threshold (see delay_threshold): what the client's queue reports read on this
+      // link when nothing is wrong, how much they jitter, and the resulting cut threshold
+      double delay_base_ms = -1;
+      double delay_jitter_ms = 0;
+      int delay_threshold_ms = 0;
+      std::chrono::steady_clock::time_point last_threshold_log;
+      int heavy_loss_seconds = 0;  // consecutive seconds over 4% all-NACK loss (for the 60% FEC step)
+
     };
 
     // Starlink reconfigures its links every 15 s at :12/:27/:42/:57 past the minute (UTC), and
@@ -582,6 +590,36 @@ namespace stream {
       platf::send(send_info);
     }
 
+    // Moonlight Starlink: the delay cut threshold adapts to the link, like WebRTC's delay controller
+    // (GCC) that GeForce Now runs on. frogtale_delay_ms (30) was tuned on Starlink, whose idle queue
+    // reading is 15-16 ms. At home on 2026-11-08 (Deck on a -70 dBm 6 GHz Wi-Fi link, 3 ms RTT) the
+    // same reports idled at 50-56 ms and jittered to 76-84 ms with nothing wrong, so every Wi-Fi
+    // retry burst cut 13.4 -> 9.7 Mbps and the picture went soft for a minute at a time, while
+    // GeForce Now on the same Deck and Wi-Fi did not flinch. The baseline is an average of reports
+    // that stayed under the threshold (a standing queue never raises it), the jitter their mean
+    // deviation, and the threshold is baseline + 3 jitters: never below frogtale_delay_ms, so
+    // Starlink keeps its tuned 30 ms, and never above 4x it, so a congested link still gets cut.
+    int delay_threshold(const history_t &history) {
+      return history.delay_threshold_ms ? history.delay_threshold_ms : config::stream.frogtale_delay_ms;
+    }
+
+    void observe_delay(history_t &history, int queue_ms) {
+      int cfg = config::stream.frogtale_delay_ms;
+      if (!cfg) {
+        return;
+      }
+      int threshold = delay_threshold(history);
+      if (history.delay_base_ms < 0) {
+        history.delay_base_ms = queue_ms;
+      } else if (queue_ms < threshold) {
+        // 4 reports a second: a time constant of ~30 s
+        history.delay_base_ms += (queue_ms - history.delay_base_ms) / 120.0;
+        history.delay_jitter_ms += (std::abs(queue_ms - history.delay_base_ms) - history.delay_jitter_ms) / 120.0;
+      }
+      int adaptive = (int) std::lround(history.delay_base_ms + 3.0 * history.delay_jitter_ms);
+      history.delay_threshold_ms = std::clamp(adaptive, cfg, cfg * 4);
+    }
+
     // What the encoder is told: the ABR rate, scaled for a handoff dip, and at half frame rate
     // 1.3x per second (so each encoded frame gets 2.6x the bits and the wire carries 0.65x).
     void raise_encoder(history_t &history) {
@@ -671,7 +709,11 @@ namespace stream {
       // the total stays similar.
       double loss_all = (double) (history.nacked_all_off_window - history.last_nacked_all) / (double) sent;
       history.last_nacked_all = history.nacked_all_off_window;
-      int fec = loss_all > 0.04 ? 60 : loss_all > 0.01 ? 40 : 0;
+      // 60% FEC is 1.6x the bytes on a link that is already dropping them; one bad second (a Wi-Fi
+      // retry burst at home on 2026-11-08 read 9-21% and flipped FEC 20 -> 60 -> 40 -> 20 within
+      // 16 s) is not worth that. The 40% step still answers a single second.
+      history.heavy_loss_seconds = loss_all > 0.04 ? history.heavy_loss_seconds + 1 : 0;
+      int fec = history.heavy_loss_seconds >= 2 ? 60 : loss_all > 0.01 ? 40 : 0;
       if (fec > history.fec_boost) {
         history.fec_boost = fec;
         history.fec_clean_seconds = 0;
@@ -726,7 +768,7 @@ namespace stream {
         history.clean_seconds = 0;
       } else if (loss > 0.01) {
         history.clean_seconds = 0;
-      } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < config::stream.frogtale_delay_ms)) {
+      } else if (loss < 0.002 && (!history.delay_reports || !config::stream.frogtale_delay_ms || delay_max_ms < delay_threshold(history))) {
         // 8 clean seconds per step (was 5): the climb bounced down and up 120 times in one session.
         // With delay reports, a second only counts as clean if the queue also stayed under half the
         // threshold, so the climb stops where the link starts queueing instead of where it drops.
@@ -777,6 +819,13 @@ namespace stream {
 
       set_bitrate(history, target, "loss %", (int) (loss * 1000) / 10.0);
       update_half_rate(history);
+
+      if (history.delay_reports && config::stream.frogtale_delay_ms && now - history.last_threshold_log > std::chrono::minutes(1)) {
+        history.last_threshold_log = now;
+        BOOST_LOG(info) << "FrogtaleTV ABR: queue baseline "sv << (int) std::lround(history.delay_base_ms) << " ms, jitter "sv
+                        << (int) std::lround(history.delay_jitter_ms) << " ms, cut threshold "sv << delay_threshold(history)
+                        << " ms (configured "sv << config::stream.frogtale_delay_ms << ")"sv;
+      }
     }
 
     // GeForce Now (WebRTC) backs off as soon as one-way delay climbs, i.e. a queue is building
@@ -819,9 +868,10 @@ namespace stream {
         history->recv_kbps[history->recv_next] = recv_kbps;
         history->recv_next = (history->recv_next + 1) % history->recv_kbps.size();
       }
+      observe_delay(*history, queue_ms);
 
-      int threshold = config::stream.frogtale_delay_ms;
-      if (!config::stream.frogtale_adaptive_bitrate || !threshold || !history->bitrate_events || !history->base_kbps) {
+      int threshold = delay_threshold(*history);
+      if (!config::stream.frogtale_adaptive_bitrate || !config::stream.frogtale_delay_ms || !history->bitrate_events || !history->base_kbps) {
         return;
       }
       if (history->blip_allowed && !history->blip && now - history->last_cut < std::chrono::seconds(3)) {
@@ -883,6 +933,7 @@ namespace stream {
           history->queue_ceiling_kbps = std::max(history->base_kbps / 8, capacity_target * 100 / 85);
         }
       }
+      BOOST_LOG(info) << "FrogtaleTV ABR: queue "sv << queue_ms << " ms over the "sv << threshold << " ms threshold"sv;
       set_bitrate(*history, std::max(history->base_kbps / 8, target), "queue ms", queue_ms);
     }
 
