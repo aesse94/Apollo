@@ -348,6 +348,10 @@ namespace stream {
       // queue). Floors the threshold for a few minutes so the same spikes do not cut again and again.
       double spike_level_ms = 0;
       std::chrono::steady_clock::time_point spike_at;
+      // A delay cut that turned out to be link jitter is reverted once the spike has passed
+      int pre_cut_kbps = 0;  // rate before the last delay cut
+      int revert_kbps = 0;  // rate to restore when the queue clears, 0 = nothing pending
+      std::chrono::steady_clock::time_point revert_deadline;
 
     };
 
@@ -909,6 +913,18 @@ namespace stream {
           BOOST_LOG(info) << "FrogtaleTV ABR: blip, the queue cleared within a second of the cut; fast climb"sv;
         }
       }
+      if (history->revert_kbps) {
+        if (queue_ms < threshold) {
+          int back = history->revert_kbps;
+          history->revert_kbps = 0;
+          history->queue_ceiling_kbps = 0;
+          BOOST_LOG(info) << "FrogtaleTV ABR: spike passed, cut reverted"sv;
+          set_bitrate(*history, back, "revert to", back);
+        } else if (now > history->revert_deadline) {
+          history->revert_kbps = 0;
+          BOOST_LOG(info) << "FrogtaleTV ABR: queue still standing, keeping the cut"sv;
+        }
+      }
       if (queue_ms < threshold) {
         history->delay_over_streak = 0;
         return;
@@ -928,7 +944,7 @@ namespace stream {
       // as jitter, so the threshold moves above it (up to the 4x cap) and the climb can resume; only a
       // queue that keeps growing past that, or loss, cuts further.
       if (history->last_cut != std::chrono::steady_clock::time_point {} && now - history->last_cut < std::chrono::seconds(90) &&
-          history->current_kbps * 10 <= history->base_kbps * 8) {
+          history->current_kbps < history->base_kbps) {
         double want = (queue_ms - history->delay_base_ms) / 2.5;
         // Remember the spike itself (plus 10%) as the link's level, so the threshold sits above it
         history->spike_level_ms = std::max(history->spike_level_ms * 0.9, queue_ms * 1.1);
@@ -940,6 +956,13 @@ namespace stream {
         history->delay_over_streak = 0;
         BOOST_LOG(info) << "FrogtaleTV ABR: queue "sv << queue_ms << " ms recurs at "sv << history->current_kbps
                         << " kbps after a cut: link jitter, cut threshold -> "sv << history->delay_threshold_ms << " ms"sv;
+        // The cut did not help (the spike came back regardless), so it was wrong: put the rate back
+        // as soon as the queue clears, like GeForce Now snapping back within seconds. If instead the
+        // queue stands over the threshold for 3 s this is real congestion and the cut stays.
+        if (history->pre_cut_kbps > history->current_kbps && now - history->last_cut < std::chrono::seconds(15)) {
+          history->revert_kbps = history->pre_cut_kbps;
+          history->revert_deadline = now + std::chrono::seconds(3);
+        }
         return;
       }
       if (++history->delay_over_streak < 2 || now - history->last_delay_step < std::chrono::seconds(1)) {
@@ -954,6 +977,8 @@ namespace stream {
       history->last_delay_step = now;
       history->clean_seconds = 0;
       history->queue_ceiling_kbps = history->current_kbps;
+      history->pre_cut_kbps = history->revert_kbps ? history->revert_kbps : history->current_kbps;
+      history->revert_kbps = 0;
       history->blip_allowed = now - history->last_cut >= std::chrono::seconds(60);
       history->blip = false;
       history->clear_after_cut = 0;
