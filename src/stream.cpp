@@ -344,6 +344,10 @@ namespace stream {
       int delay_threshold_ms = 0;
       std::chrono::steady_clock::time_point last_threshold_log;
       int heavy_loss_seconds = 0;  // consecutive seconds over 4% all-NACK loss (for the 60% FEC step)
+      // The link's own spike level: queue readings that recurred after a cut (Wi-Fi retries, not our
+      // queue). Floors the threshold for a few minutes so the same spikes do not cut again and again.
+      double spike_level_ms = 0;
+      std::chrono::steady_clock::time_point spike_at;
 
     };
 
@@ -632,6 +636,14 @@ namespace stream {
     void update_delay_threshold(history_t &history) {
       int cfg = config::stream.frogtale_delay_ms;
       int adaptive = (int) std::lround(history.delay_base_ms + std::max(3.0 * history.delay_jitter_ms, (double) cfg));
+      // A spike level learned from recurring spikes fades with a 3-minute time constant: the jitter
+      // EWMA alone forgot it within 20 s (14:57 on 2026-11-08: threshold 115 -> 53 in 25 s), so every
+      // minute the same Wi-Fi spike cut the bitrate again and the climb never got going.
+      if (history.spike_level_ms > 0) {
+        double age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - history.spike_at).count();
+        int spike_floor = (int) std::lround(history.spike_level_ms * std::exp(-age_s / 180.0));
+        adaptive = std::max(adaptive, spike_floor);
+      }
       history.delay_threshold_ms = std::clamp(adaptive, cfg, cfg * 4);
     }
 
@@ -837,9 +849,10 @@ namespace stream {
 
       if (history.delay_reports && config::stream.frogtale_delay_ms && now - history.last_threshold_log > std::chrono::minutes(1)) {
         history.last_threshold_log = now;
+        update_delay_threshold(history);  // let a learned spike level fade on schedule
         BOOST_LOG(info) << "FrogtaleTV ABR: queue baseline "sv << (int) std::lround(history.delay_base_ms) << " ms, jitter "sv
-                        << (int) std::lround(history.delay_jitter_ms) << " ms, cut threshold "sv << delay_threshold(history)
-                        << " ms (configured "sv << config::stream.frogtale_delay_ms << ")"sv;
+                        << (int) std::lround(history.delay_jitter_ms) << " ms, spike level "sv << (int) std::lround(history.spike_level_ms)
+                        << " ms, cut threshold "sv << delay_threshold(history) << " ms (configured "sv << config::stream.frogtale_delay_ms << ")"sv;
       }
     }
 
@@ -917,14 +930,17 @@ namespace stream {
       if (history->last_cut != std::chrono::steady_clock::time_point {} && now - history->last_cut < std::chrono::seconds(90) &&
           history->current_kbps * 10 <= history->base_kbps * 8) {
         double want = (queue_ms - history->delay_base_ms) / 2.5;
+        // Remember the spike itself (plus 10%) as the link's level, so the threshold sits above it
+        history->spike_level_ms = std::max(history->spike_level_ms * 0.9, queue_ms * 1.1);
+        history->spike_at = now;
         if (want > history->delay_jitter_ms) {
           history->delay_jitter_ms += (want - history->delay_jitter_ms) * 0.5;
-          update_delay_threshold(*history);
-          history->delay_over_streak = 0;
-          BOOST_LOG(info) << "FrogtaleTV ABR: queue "sv << queue_ms << " ms recurs at "sv << history->current_kbps
-                          << " kbps after a cut: link jitter, cut threshold -> "sv << history->delay_threshold_ms << " ms"sv;
-          return;
         }
+        update_delay_threshold(*history);
+        history->delay_over_streak = 0;
+        BOOST_LOG(info) << "FrogtaleTV ABR: queue "sv << queue_ms << " ms recurs at "sv << history->current_kbps
+                        << " kbps after a cut: link jitter, cut threshold -> "sv << history->delay_threshold_ms << " ms"sv;
+        return;
       }
       if (++history->delay_over_streak < 2 || now - history->last_delay_step < std::chrono::seconds(1)) {
         return;
