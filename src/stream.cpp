@@ -608,15 +608,23 @@ namespace stream {
       if (!cfg) {
         return;
       }
-      int threshold = delay_threshold(history);
+      // Every report feeds the baseline, clamped to baseline + 2x the configured threshold, so a
+      // link that idles above the floor is learned (the first version only counted reports under
+      // the threshold and never learned a 50 ms idle at all: 14:35 on 2026-11-08 still cut 13.4 ->
+      // 4.5 Mbps on 51 and 66 ms readings "over the 30 ms threshold"), while a standing queue can
+      // only drag the baseline up slowly and boundedly, and the 4x cap keeps real congestion cutting.
       if (history.delay_base_ms < 0) {
         history.delay_base_ms = queue_ms;
-      } else if (queue_ms < threshold) {
-        // 4 reports a second: a time constant of ~30 s
-        history.delay_base_ms += (queue_ms - history.delay_base_ms) / 120.0;
-        history.delay_jitter_ms += (std::abs(queue_ms - history.delay_base_ms) - history.delay_jitter_ms) / 120.0;
+        history.delay_jitter_ms = cfg / 4.0;
+      } else {
+        double sample = std::min<double>(queue_ms, history.delay_base_ms + 2.0 * cfg);
+        // 4 reports a second: a time constant of ~20 s
+        history.delay_base_ms += (sample - history.delay_base_ms) / 80.0;
+        history.delay_jitter_ms += (std::abs(sample - history.delay_base_ms) - history.delay_jitter_ms) / 80.0;
       }
-      int adaptive = (int) std::lround(history.delay_base_ms + 3.0 * history.delay_jitter_ms);
+      // Headroom above the baseline: three jitters, but at least the configured threshold itself,
+      // so a very steady link still needs a real rise before it is called congested
+      int adaptive = (int) std::lround(history.delay_base_ms + std::max(3.0 * history.delay_jitter_ms, (double) cfg));
       history.delay_threshold_ms = std::clamp(adaptive, cfg, cfg * 4);
     }
 
@@ -921,7 +929,10 @@ namespace stream {
       // Only when we are actually filling the link: in a quiet scene the encoder sends far below its
       // target, and "delivered" is just what we sent (11:39:24 on 2026-10-16: 661 of 737 kbps on the
       // wire cut the target 9.7 -> 7.4 Mbps). The wire normally runs above the target (FEC).
-      if (recv_median > 0 && history->wire_kbps > 0 && recv_median < history->wire_kbps &&
+      // ...and only when the queue is well over the threshold: a reading just past it on a jittery
+      // Wi-Fi link (51 ms at 14:35 on 2026-11-08) is not a capacity measurement, and 250 ms receive
+      // windows on Wi-Fi under-read by 40-60% in bursts, which turned a 15% step into a 60% one.
+      if (queue_ms >= threshold * 2 && recv_median > 0 && history->wire_kbps > 0 && recv_median < history->wire_kbps &&
           history->wire_kbps * 2 >= history->current_kbps) {
         int capacity_target = (int) ((int64_t) history->current_kbps * recv_median * 85 / 100 / history->wire_kbps);
         if (capacity_target < target) {
