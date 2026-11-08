@@ -603,6 +603,8 @@ namespace stream {
       return history.delay_threshold_ms ? history.delay_threshold_ms : config::stream.frogtale_delay_ms;
     }
 
+    void update_delay_threshold(history_t &history);
+
     void observe_delay(history_t &history, int queue_ms) {
       int cfg = config::stream.frogtale_delay_ms;
       if (!cfg) {
@@ -622,8 +624,13 @@ namespace stream {
         history.delay_base_ms += (sample - history.delay_base_ms) / 80.0;
         history.delay_jitter_ms += (std::abs(sample - history.delay_base_ms) - history.delay_jitter_ms) / 80.0;
       }
-      // Headroom above the baseline: three jitters, but at least the configured threshold itself,
-      // so a very steady link still needs a real rise before it is called congested
+      update_delay_threshold(history);
+    }
+
+    // Headroom above the baseline: three jitters, but at least the configured threshold itself,
+    // so a very steady link still needs a real rise before it is called congested
+    void update_delay_threshold(history_t &history) {
+      int cfg = config::stream.frogtale_delay_ms;
       int adaptive = (int) std::lround(history.delay_base_ms + std::max(3.0 * history.delay_jitter_ms, (double) cfg));
       history.delay_threshold_ms = std::clamp(adaptive, cfg, cfg * 4);
     }
@@ -900,6 +907,24 @@ namespace stream {
       if (recv_kbps && (int64_t) recv_kbps * 4 < history->current_kbps) {
         history->delay_over_streak = 0;
         return;
+      }
+      // A spike that comes back after we already cut, at well under the base rate, is not a queue we
+      // are building: it is the link's own jitter (Wi-Fi retries at -71 dBm on 2026-11-08 14:44-14:48
+      // read 70-90 ms every 30-60 s at every rate, and eight cuts in a row took 13.4 Mbps down to 3.6
+      // with no way back, because no second was "clean" under a 35 ms threshold). Learn such a spike
+      // as jitter, so the threshold moves above it (up to the 4x cap) and the climb can resume; only a
+      // queue that keeps growing past that, or loss, cuts further.
+      if (history->last_cut != std::chrono::steady_clock::time_point {} && now - history->last_cut < std::chrono::seconds(90) &&
+          history->current_kbps * 10 <= history->base_kbps * 8) {
+        double want = (queue_ms - history->delay_base_ms) / 2.5;
+        if (want > history->delay_jitter_ms) {
+          history->delay_jitter_ms += (want - history->delay_jitter_ms) * 0.5;
+          update_delay_threshold(*history);
+          history->delay_over_streak = 0;
+          BOOST_LOG(info) << "FrogtaleTV ABR: queue "sv << queue_ms << " ms recurs at "sv << history->current_kbps
+                          << " kbps after a cut: link jitter, cut threshold -> "sv << history->delay_threshold_ms << " ms"sv;
+          return;
+        }
       }
       if (++history->delay_over_streak < 2 || now - history->last_delay_step < std::chrono::seconds(1)) {
         return;
